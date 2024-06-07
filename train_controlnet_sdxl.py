@@ -754,10 +754,10 @@ def prepare_train_dataset(dataset, accelerator):
     )
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[args.image_column]]
+        images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
         images = [image_transforms(image) for image in images]
 
-        conditioning_images = [image.convert("RGB") for image in examples[args.conditioning_image_column]]
+        conditioning_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
 
         examples["pixel_values"] = images
@@ -899,6 +899,15 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
 
+    
+    
+    #####TODO: Initialize Reward Model
+    ###reward model initialize
+    ###reward model initialize
+    ###reward model initialize
+    #####TODO: Initialize Reward Model
+    
+    
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
@@ -1059,16 +1068,13 @@ def main(args):
     tokenizers = [tokenizer_one, tokenizer_two]
 
     train_dataset = get_train_dataset(args, accelerator)
-    print('--------',train_dataset)
     compute_embeddings_fn = functools.partial(
         compute_embeddings,
         text_encoders=text_encoders,
         tokenizers=tokenizers,
         proportion_empty_prompts=args.proportion_empty_prompts,
     )
-    print(train_dataset,'----->>')
 
-    print(compute_embeddings_fn)
     with accelerator.main_process_first():
         from datasets.fingerprint import Hasher
 
@@ -1076,7 +1082,7 @@ def main(args):
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
         new_fingerprint = Hasher.hash(args)
         train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint)
-    print(train_dataset)
+
     del text_encoders, tokenizers
     gc.collect()
     torch.cuda.empty_cache()
@@ -1194,6 +1200,29 @@ def main(args):
                 if args.pretrained_vae_model_name_or_path is None:
                     latents = latents.to(weight_dtype)
 
+                
+                
+                #####TODO: we generate images, latents, log_probs
+                ###generation
+                ###generation
+                ###generation
+                #####TODO: we generate images, latents, log_probs
+                
+                #####TODO: we compute rewards
+                ###computing rewards
+                ###computing rewards
+                ###computing rewards
+                #####TODO: we compute rewards
+                
+                #####TODO: turn rewards into advantages
+                ###turning it into advantages
+                ###turning it into advantages
+                ###turning it into advantages
+                #####TODO: turn rewards into advantages
+                              
+                              
+                              
+                #####TODO: we calculate loss
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -1229,7 +1258,7 @@ def main(args):
                     mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
                     return_dict=False,
                 )[0]
-
+                
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -1246,6 +1275,7 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+                #####TODO: we calculate loss
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
