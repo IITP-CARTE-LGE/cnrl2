@@ -40,6 +40,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+from reward import RewardComputation
 
 import diffusers
 from diffusers import (
@@ -790,6 +791,45 @@ def collate_fn(examples):
         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
     }
 
+def calculate_loss(latents, timesteps, next_latents, log_probs, advantages, conditioning_pixel_values, prompt_embeds, text_embeds, time_ids):
+    """
+    Calculate the loss for a batch of an unpacked sample
+
+    Args:
+        latents (torch.Tensor):
+            The latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+        timesteps (torch.Tensor):
+            The timesteps sampled from the diffusion model, shape: [batch_size]
+        next_latents (torch.Tensor):
+            The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+        log_probs (torch.Tensor):
+            The log probabilities of the latents, shape: [batch_size]
+        advantages (torch.Tensor):
+            The advantages of the latents, shape: [batch_size]
+        embeds (torch.Tensor):
+            The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
+            Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
+
+    Returns:
+        loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
+        (all of these are of shape (1,))
+    """
+
+
+    return loss, approx_kl, clipfrac
+
+def loss_(
+    advantages: torch.Tensor,
+    clip_range: float,
+    ratio: torch.Tensor,
+):
+    unclipped_loss = -advantages * ratio
+    clipped_loss = -advantages * torch.clamp(
+        ratio,
+        1.0 - clip_range,
+        1.0 + clip_range,
+    )
+    return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -899,14 +939,7 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
 
-    
-    
-    #####TODO: Initialize Reward Model
-    ###reward model initialize
-    ###reward model initialize
-    ###reward model initialize
-    #####TODO: Initialize Reward Model
-    
+    reward_computation = RewardComputation(accelerator.device)
     
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1208,74 +1241,182 @@ def main(args):
                 ###generation
                 #####TODO: we generate images, latents, log_probs
                 
-                #####TODO: we compute rewards
-                ###computing rewards
-                ###computing rewards
-                ###computing rewards
+                #####TODO (DONE): we compute rewards
+                # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)            
+                samples = {k: torch.cat([s[k] for s in samples]) if k != "prompts" else [s[k] for s in samples] for k in samples[0].keys()}
+                rewards, rewards_metadata = self.compute_rewards(
+                    prompt_image_data, is_async=self.config.async_reward_computation
+                )
+                rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_data)
                 #####TODO: we compute rewards
                 
                 #####TODO: turn rewards into advantages
-                ###turning it into advantages
-                ###turning it into advantages
-                ###turning it into advantages
-                #####TODO: turn rewards into advantages
-                              
-                              
-                              
-                #####TODO: we calculate loss
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+                for i, image_data in enumerate(prompt_image_data):
+                    image_data.extend([rewards[i], rewards_metadata[i]])
 
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                # if self.image_samples_callback is not None:
+                #     self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
+                rewards = torch.cat(rewards)
+                rewards = accelerator.gather(rewards).cpu().numpy()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # ControlNet conditioning.
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=batch["prompt_ids"],
-                    added_cond_kwargs=batch["unet_added_conditions"],
-                    controlnet_cond=controlnet_image,
-                    return_dict=False,
+                accelerator.log(
+                    {
+                        "reward": rewards,
+                        "epoch": epoch,
+                        "reward_mean": rewards.mean(),
+                        "reward_std": rewards.std(),
+                    },
+                    step=global_step,
                 )
 
-                # Predict the noise residual
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=batch["prompt_ids"],
-                    added_cond_kwargs=batch["unet_added_conditions"],
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-                    return_dict=False,
-                )[0]
-                
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = controlnet.parameters()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+                # ungather advantages;  keep the entries corresponding to the samples on this process
+                samples["advantages"] = (
+                    torch.as_tensor(advantages)
+                    .reshape(accelerator.num_processes, -1)[accelerator.process_index]
+                    .to(accelerator.device)
+                )
+
+                del samples["prompts"]
+
+                total_batch_size, num_timesteps = samples["timesteps"].shape
+
+                ##########TODO HERE TO BE MODIFIED : for loop removed from here
+                # shuffle samples along batch dimension
+                perm = torch.randperm(total_batch_size, device=accelerator.device)
+                _samples = {}
+                for k, v in samples.items():
+                    v = v.to(accelerator.device)
+                    _samples[k] = v[perm]
+                samples = _samples
+
+                # shuffle along time dimension independently for each sample
+                # still trying to understand the code below
+                perms = torch.stack(
+                    [torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)]
+                )
+
+                for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                    samples[key] = samples[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms,
+                    ]
+
+                original_keys = samples.keys()
+                original_values = samples.values()
+                # rebatch them as user defined train_batch_size is different from sample_batch_size
+                reshaped_values = [v.reshape(-1, args.train_batch_size *v.shape[1:]) for v in original_values]
+
+                # Transpose the list of original values
+                transposed_values = zip(*reshaped_values)
+                #####TODO: turn rewards into advantages
+                              
+                              
+                              
                 #####TODO: we calculate loss
+                # samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
+                # self.sd_pipeline.controlnet.train()
+                # global_step = self._train_batched_samples(epoch, global_step, samples_batched)
+
+            info = defaultdict(list)
+            for _i, sample in tqdm(enumerate(batched_samples)):
+                #### TODO adding negative prompt
+                # concat negative prompts to sample prompts to avoid two forward passes
+                #     embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
+
+                for j in range(self.num_train_timesteps):
+                    with accelerator.accumulate(controlnet):
+                        latents = sample["latents"][:, j] 
+                        timesteps = sample["timesteps"][:, j]
+                        next_latents = sample["next_latents"][:, j]
+                        log_probs = sample["log_probs"][:, j]
+                        advantages = sample["advantages"]
+                        conditioning_pixel_values = sample["conditioning_pixel_values"]
+                        prompt_embeds = sample["prompt_embeds"]
+                        text_embeds = sample["text_embeds"]
+                        time_ids = sample["time_ids"]
+
+                        with accelerator.autocast():
+                            controlnet_image = conditioning_pixel_values.to(dtype=args.mixed_precision)
+                            unet_added_conditions = {"text_embeds" : torch.cat([text_embeds] * 2), "time_ids" : torch.cat([time_ids] * 2)}
+                            down_block_res_samples, mid_block_res_sample = controlnet(
+                                torch.cat([latents] * 2),
+                                torch.cat([timesteps] * 2),
+                                encoder_hidden_states=torch.cat([prompt_embeds] * 2),
+                                added_cond_kwargs=unet_added_conditions,
+                                controlnet_cond=torch.cat([controlnet_image] * 2),
+                                return_dict=False,
+                            )
+                            noise_pred = unet(
+                                torch.cat([latents] * 2),
+                                torch.cat([timesteps] * 2),
+                                encoder_hidden_states=torch.cat([prompt_embeds] * 2),
+                                added_cond_kwargs=unet_added_conditions,
+                                down_block_additional_residuals=[
+                                    sample.to(dtype=args.mixed_precision) for sample in down_block_res_samples
+                                ],
+                                mid_block_additional_residual=mid_block_res_sample.to(dtype=args.mixed_precision),
+                                return_dict=False
+                            )[0]
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
+                                noise_pred_text - noise_pred_uncond
+                            )
+
+                            scheduler_step_output = self.sd_pipeline.scheduler_step(
+                                noise_pred,
+                                timesteps,
+                                latents,
+                                eta=self.config.sample_eta,
+                                variance_noise=next_latents,
+                            )
+
+                            log_prob = scheduler_step_output.log_probs
+
+                        advantages = torch.clamp(
+                            advantages,
+                            -self.config.train_adv_clip_max,
+                            self.config.train_adv_clip_max,
+                        )
+
+                        ratio = torch.exp(log_prob - log_probs)
+
+                        loss = loss_(advantages, self.config.train_clip_range, ratio)
+
+                        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
+
+                        clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+
+
+                        info["approx_kl"].append(approx_kl)
+                        info["clipfrac"].append(clipfrac)
+                        info["loss"].append(loss)
+
+                        accelerator.backward(loss)
+                        # changed this ----- trainable_layers (deleted)
+                        if accelerator.sync_gradients:
+                            params_to_clip = controlnet.parameters()
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+    
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+
+                    # Checks if the accelerator has performed an optimization step behind the scenes
+                    ################# TODO: need to check here
+                    if accelerator.sync_gradients:
+                        # log training-related stuff
+                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                        info = self.accelerator.reduce(info, reduction="mean")
+                        info.update({"epoch": epoch})
+                        accelerator.log(info, step=global_step)
+                        global_step += 1
+                        info = defaultdict(list)
+
+                #####TODO: we calculate loss
+
+    ###########Newly added codes end here###########
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
