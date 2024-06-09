@@ -1389,8 +1389,9 @@ def main(args):
                     noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
-                    ### we need latents, and log_probs
+                    ### TODO:we need latents, and log_probs
                     latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    ### TODO:we need latents, and log_probs
                     
                     
                 
