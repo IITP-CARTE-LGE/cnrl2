@@ -3,3 +3,4 @@ save/
 test_tmp/
 train_example.py
 train_example.sh
+*.lock

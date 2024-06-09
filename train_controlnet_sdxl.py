@@ -817,16 +817,12 @@ def collate_fn(examples):
 
     ### text embeddings for inference
 
-    inf_prompt_ids = torch.stack([torch.cat([torch.tensor(example["neg_prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1), torch.tensor(example["prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1)], dim=0)  for example in examples])
-    inf_add_text_embeds = torch.stack([torch.cat([torch.tensor(example["neg_text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
-    inf_add_time_ids = torch.stack([torch.cat([torch.tensor(example["neg_time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
-
-
-    
-    
-    # neg_prompt_ids = torch.stack([torch.tensor(example["neg_prompt_embeds"]) for example in examples])
-    # neg_add_text_embeds = torch.stack([torch.tensor(example["neg_text_embeds"]) for example in examples])
-    # neg_add_time_ids =  torch.stack([torch.tensor(example["neg_time_ids"]) for example in examples])
+    # inf_prompt_ids = torch.stack([torch.cat([torch.tensor(example["neg_prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1), torch.tensor(example["prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1)], dim=0)  for example in examples])
+    # inf_add_text_embeds = torch.stack([torch.cat([torch.tensor(example["neg_text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
+    # inf_add_time_ids = torch.stack([torch.cat([torch.tensor(example["neg_time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
+    neg_prompt_ids = torch.stack([torch.tensor(example["neg_prompt_embeds"]) for example in examples])
+    neg_add_text_embeds = torch.stack([torch.tensor(example["neg_text_embeds"]) for example in examples])
+    neg_add_time_ids =  torch.stack([torch.tensor(example["neg_time_ids"]) for example in examples])
     
     # inf_prompt_ids = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_prompt_ids, prompt_ids)])
     # inf_add_text_embeds = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_add_text_embeds, add_text_embeds)])
@@ -837,9 +833,9 @@ def collate_fn(examples):
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
-        "inf_prompt_ids": inf_prompt_ids,
+        "neg_prompt_ids": neg_prompt_ids,
         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
-        "inf_unet_added_conditions": {"text_embeds": inf_add_text_embeds, "time_ids": inf_add_time_ids},
+        "neg_unet_added_conditions": {"text_embeds": neg_add_text_embeds, "time_ids": neg_add_time_ids},
     }
 
 def prepare_extra_step_kwargs(scheduler, generator, eta):
@@ -1289,8 +1285,9 @@ def main(args):
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
+            
+            
             #####TODO: we generate images, latents, log_probs
-            ###preparing noise
             controlnet.eval()
             with torch.no_grad():
                 num_channels_latents = unet.config.in_channels
@@ -1300,6 +1297,8 @@ def main(args):
                     unet.config.sample_size,
                     unet.config.sample_size
                 )
+                
+                ### preparing latents
                 latents = randn_tensor(shape, device=accelerator.device, dtype=weight_dtype) #add generator if needed, device needs to be checked
                 latents = latents * noise_scheduler.init_noise_sigma
                 all_latents = [latents]
@@ -1308,9 +1307,9 @@ def main(args):
                 ###preparing timesteps
                 noise_scheduler.set_timesteps(args.num_train_inference_steps, device=latents.device)
                 timesteps = noise_scheduler.timesteps        
-                
                 extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, None, 0.0) #scheduler, generator, eta
-                #####TODO: Create tensor stating which controlnets to keep
+                
+                ### for cond_scale
                 controlnet_keep = []
                 for i in range(len(timesteps)):
                     keeps = [
@@ -1323,11 +1322,18 @@ def main(args):
                 is_unet_compiled = is_compiled_module(unet)
                 is_controlnet_compiled = is_compiled_module(controlnet)
                 is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
-                #####TODO: Create tensor stating which controlnets to keep
+                
+                ### preparing encoder_hidden_states, controlnet_cond, added_cond_kwargs from dataloader
+                encoder_hidden_states = torch.cat([batch["neg_prompt_ids"], batch["prompt_ids"]], dim=0)
+                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                add_text_embeds = torch.cat([batch['neg_unet_added_conditions']['text_embeds'], batch['unet_added_conditions']['text_embeds']], dim=0)
+                add_time_ids = torch.cat([batch['neg_unet_added_conditions']['time_ids'], batch['unet_added_conditions']['time_ids']], dim=0)
+                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 
                 ###generation: use inf_*** from batch for text prompts
                 # (1) saving all latents & log_probs is needed
                 # (2) do_classifier_free_guidance=True : make it double
+                
                 for i, t in enumerate(timesteps):
                     if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
                         torch._inductor.cudagraph_mark_step_begin()
@@ -1335,51 +1341,45 @@ def main(args):
                     latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
                     
                     control_model_input = latent_model_input
-                    
-                    if isinstance(controlnet_keep[i], list):
-                        cond_scale = [c * s for c, s in zip(1.0, controlnet_keep[i])] # 1.0 == controlnet_conditioning_scale
-                    else:
-                        controlnet_cond_scale = 1.0
-                        if isinstance(controlnet_cond_scale, list):
-                            controlnet_cond_scale = controlnet_cond_scale[0]
-                        cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                
+                    controlnet_cond_scale = 1.0
+                    if isinstance(controlnet_cond_scale, list):
+                        controlnet_cond_scale = controlnet_cond_scale[0]
+                    cond_scale = controlnet_cond_scale * controlnet_keep[i]
                         
                     # ControlNet conditioning.
-                    controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
                     
-                    batch["inf_prompt_ids"] = batch["inf_prompt_ids"].squeeze()
-                    batch["inf_unet_added_conditions"]['text_embeds'] = batch["inf_unet_added_conditions"]['text_embeds'].squeeze()
-                    batch['inf_unet_added_conditions']['time_ids'] = batch['inf_unet_added_conditions']['time_ids'].squeeze()
                     
-                    # print(f"control_model_input.shape:{control_model_input.shape}")
-                    # print(f"batch['inf_prompt_ids'].shape:{batch['inf_prompt_ids'].shape}")
-                    # print(f"batch['inf_unet_added_conditions'text_embeds'].shape:{batch['inf_unet_added_conditions']['text_embeds'].shape}")
-                    # print(f"batch['inf_unet_added_conditions'].['time_ids']shape:{batch['inf_unet_added_conditions']['time_ids'].shape}")
-                    # print(f"torch.cat([controlnet_image] * 2)shape:{torch.cat([controlnet_image] * 2).shape}")
-                    # print(f"cond_scale.shape:{cond_scale}")
+                    print(f"control_model_input.shape:{control_model_input.shape}")
+                    print(f"encoder_hidden_states.shape:{encoder_hidden_states.shape}")
+                    print(f"added_cond_kwargs['text_embeds'].shape:{added_cond_kwargs['text_embeds'].shape}")
+                    print(f"added_cond_kwargs['time_ids'].shape:{added_cond_kwargs['time_ids'].shape}")
+                    print(f"torch.cat([controlnet_image] * 2)shape:{torch.cat([controlnet_image] * 2).shape}")
+                    print(f"cond_scale.shape:{cond_scale}")
                     # control_model_input.shape:torch.Size([2, 4, 128, 128])
                     # batch['inf_prompt_ids'].shape:torch.Size([1, 2, 77, 2048])
                     # batch['inf_unet_added_conditions'text_embeds'].shape:torch.Size([1, 2, 1280])
                     # batch['inf_unet_added_conditions'].['time_ids']shape:torch.Size([1, 2, 6])
                     # torch.cat([controlnet_image] * 2)shape:torch.Size([2, 3, 1024, 1024])
+                    
                     down_block_res_samples, mid_block_res_sample = controlnet(
-                        control_model_input,
-                        t,
-                        encoder_hidden_states=batch["inf_prompt_ids"],
+                        control_model_input, #매번
+                        t, #매번
+                        encoder_hidden_states=encoder_hidden_states,
                         controlnet_cond=torch.cat([controlnet_image] * 2),
                         conditioning_scale=cond_scale,
                         guess_mode=False,
-                        added_cond_kwargs=batch["inf_unet_added_conditions"],
+                        added_cond_kwargs=added_cond_kwargs,
                         return_dict=False,
                     )
 
                     noise_pred = unet(
                         latent_model_input,
                         t,
-                        encoder_hidden_states=batch["inf_prompt_ids"],
+                        encoder_hidden_states=encoder_hidden_states,
                         timestep_cond=None,
                         cross_attention_kwargs=None,
-                        added_cond_kwargs=batch["inf_unet_added_conditions"],
+                        added_cond_kwargs=added_cond_kwargs,
                         down_block_additional_residuals=down_block_res_samples,
                         mid_block_additional_residual=mid_block_res_sample,
                         return_dict=False,
@@ -1389,9 +1389,12 @@ def main(args):
                     noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
-                    ###latents to image 
+                    ### we need latents, and log_probs
                     latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
                     
+                    
+                
+                ### latents to image
                 needs_upcasting = vae.dtype == torch.float16 and vae.config.force_upcast
                 if needs_upcasting:
                     upcast_vae(vae)
@@ -1417,12 +1420,10 @@ def main(args):
                 # cast back to fp16 if needed
                 if needs_upcasting:
                     vae.to(dtype=torch.float16)
+                    
                 image = image_processor.postprocess(image, output_type='pil')
                 
-                image[0].save(f'./test_tmp/img_{np.random.randint(0,34874378)}.png')
-                print('YESYEYSEYSEYESYESYESYESYESYEYSESYESYSEYESYYES')
-                import sys
-                sys.exit()
+
                 #####TODO: we generate images, latents, log_probs
                 
                 #####TODO: we compute rewards

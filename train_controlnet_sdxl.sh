@@ -10,12 +10,12 @@ accelerate launch --config_file ./ac_config.yaml --main_process_port 29501 train
  --pretrained_vae_model_name_or_path madebyollin/sdxl-vae-fp16-fix \
  --controlnet_model_name_or_path thibaud/controlnet-openpose-sdxl-1.0 \
  --output_dir=$OUTPUT_DIR \
- --train_data_dir='/scratch/heywon/data/output1.jsonl' \
+ --train_data_dir='/scratch/heywon/data/output.jsonl' \
  --mixed_precision="fp16" \
  --resolution=1024 \
  --learning_rate=1e-5 \
  --max_train_steps=15000 \
- --train_batch_size=1 \
+ --train_batch_size=2 \
  --gradient_accumulation_steps=1 \
  --caption_column 'text' \
  --image_column 'image' \
