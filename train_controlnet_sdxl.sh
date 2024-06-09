@@ -9,8 +9,8 @@ accelerate launch --config_file ./ac_config.yaml --main_process_port 10000 train
  --controlnet_model_name_or_path thibaud/controlnet-openpose-sdxl-1.0 \
  --output_dir=$OUTPUT_DIR \
  --resolution=1024 \
- --train_data_dir='/scratch/heywon/data/output1.jsonl' \
- --train_batch_size=1 \
+ --train_data_dir='/scratch/heywon/data/output.jsonl' \
+ --train_batch_size=2 \
  --gradient_accumulation_steps=1 \
  --gradient_checkpointing \
  --enable_xformers_memory_efficient_attention \

@@ -1480,7 +1480,7 @@ def main(args):
                 ###preparing timesteps
                 noise_scheduler.set_timesteps(args.num_train_inference_steps, device=latents.device)
                 timesteps = noise_scheduler.timesteps        
-                extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, None, 0.0) #scheduler, generator, eta
+                extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, None, 1.0) #scheduler, generator, eta
                 
                 ### for cond_scale
                 controlnet_keep = []
@@ -1580,6 +1580,8 @@ def main(args):
                     vae.to(dtype=torch.float16)
                     
                 images = image_processor.postprocess(image, output_type='pil')
+                images[0].save(f'./step_{step}_0.png')
+                images[1].save(f'./step_{step}_1.png')
                 #####TODO[Done]: we generate images, latents, log_probs
 
 
@@ -1673,8 +1675,7 @@ def main(args):
             original_keys = samples.keys()
             original_values = samples.values()
             # rebatch them as user defined train_batch_size is different from sample_batch_size
-            for v in original_values:
-                print('-->>>>,',v.shape[1:])
+
             reshaped_values = [v.reshape(-1, args.train_batch_size *v.shape[1:]) for v in original_values]
 
             # Transpose the list of original values
