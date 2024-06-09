@@ -47,7 +47,8 @@ import diffusers
 from diffusers import (
     AutoencoderKL,
     ControlNetModel,
-    DDPMScheduler,
+    # DDPMScheduler,
+    DDIMScheduler,
     StableDiffusionXLControlNetPipeline,
     UNet2DConditionModel,
     UniPCMultistepScheduler,
@@ -810,26 +811,19 @@ def collate_fn(examples):
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    prompts = [example["prompts"] for example in examples]
     prompt_ids = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
 
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
     ### text embeddings for inference
-
-    # inf_prompt_ids = torch.stack([torch.cat([torch.tensor(example["neg_prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1), torch.tensor(example["prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1)], dim=0)  for example in examples])
-    # inf_add_text_embeds = torch.stack([torch.cat([torch.tensor(example["neg_text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
-    # inf_add_time_ids = torch.stack([torch.cat([torch.tensor(example["neg_time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
     neg_prompt_ids = torch.stack([torch.tensor(example["neg_prompt_embeds"]) for example in examples])
     neg_add_text_embeds = torch.stack([torch.tensor(example["neg_text_embeds"]) for example in examples])
     neg_add_time_ids =  torch.stack([torch.tensor(example["neg_time_ids"]) for example in examples])
-    
-    # inf_prompt_ids = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_prompt_ids, prompt_ids)])
-    # inf_add_text_embeds = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_add_text_embeds, add_text_embeds)])
-    # inf_add_time_ids = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_add_time_ids, add_time_ids)])
-
-    
+        
     return {
+        "prompts": prompts,
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
@@ -855,7 +849,7 @@ def prepare_extra_step_kwargs(scheduler, generator, eta):
         extra_step_kwargs["generator"] = generator
     return extra_step_kwargs
 
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_upscale.StableDiffusionUpscalePipeline.upcast_vae
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_upscale.StableDiffusionUpscalePipeline.upcast_vae
 def upcast_vae(vae):
     dtype = vae.dtype
     vae.to(dtype=torch.float32)
@@ -874,6 +868,142 @@ def upcast_vae(vae):
         vae.post_quant_conv.to(dtype)
         vae.decoder.conv_in.to(dtype)
         vae.decoder.mid_block.to(dtype)
+        
+def scheduler_step(
+    self,
+    model_output: torch.FloatTensor,
+    timestep: int,
+    sample: torch.FloatTensor,
+    eta: float = 0.0,
+    use_clipped_model_output: bool = False,
+    generator = None,
+    variance_noise = None,
+    return_dict: bool = True,
+):
+    """
+    Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
+    process from the learned model outputs (most often the predicted noise).
+
+    Args:
+        model_output (`torch.FloatTensor`):
+            The direct output from learned diffusion model.
+        timestep (`float`):
+            The current discrete timestep in the diffusion chain.
+        sample (`torch.FloatTensor`):
+            A current instance of a sample created by the diffusion process.
+        eta (`float`):
+            The weight of noise for added noise in diffusion step.
+        use_clipped_model_output (`bool`, defaults to `False`):
+            If `True`, computes "corrected" `model_output` from the clipped predicted original sample. Necessary
+            because predicted original sample is clipped to [-1, 1] when `self.config.clip_sample` is `True`. If no
+            clipping has happened, "corrected" `model_output` would coincide with the one provided as input and
+            `use_clipped_model_output` has no effect.
+        generator (`torch.Generator`, *optional*):
+            A random number generator.
+        variance_noise (`torch.FloatTensor`):
+            Alternative to generating noise with `generator` by directly providing the noise for the variance
+            itself. Useful for methods such as [`CycleDiffusion`].
+        return_dict (`bool`, *optional*, defaults to `True`):
+            Whether or not to return a [`~schedulers.scheduling_ddim.DDIMSchedulerOutput`] or `tuple`.
+
+    Returns:
+        [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] or `tuple`:
+            If return_dict is `True`, [`~schedulers.scheduling_ddim.DDIMSchedulerOutput`] is returned, otherwise a
+            tuple is returned where the first element is the sample tensor.
+
+    """
+    if self.num_inference_steps is None:
+        raise ValueError(
+            "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+        )
+
+    # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
+    # Ideally, read DDIM paper in-detail understanding
+
+    # Notation (<variable name> -> <name in paper>
+    # - pred_noise_t -> e_theta(x_t, t)
+    # - pred_original_sample -> f_theta(x_t, t) or x_0
+    # - std_dev_t -> sigma_t
+    # - eta -> η
+    # - pred_sample_direction -> "direction pointing to x_t"
+    # - pred_prev_sample -> "x_t-1"
+
+    # 1. get previous step value (=t-1)
+    prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+
+    # 2. compute alphas, betas
+    # self.alphas_cumprod = self.alphas_cumprod.to('cuda')
+    alpha_prod_t = self.alphas_cumprod[timestep]
+    alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+
+    beta_prod_t = 1 - alpha_prod_t
+
+    # 3. compute predicted original sample from predicted noise also called
+    # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    if self.config.prediction_type == "epsilon":
+        pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+        pred_epsilon = model_output
+    elif self.config.prediction_type == "sample":
+        pred_original_sample = model_output
+        pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+    elif self.config.prediction_type == "v_prediction":
+        pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+        pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+    else:
+        raise ValueError(
+            f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
+            " `v_prediction`"
+        )
+
+    # 4. Clip or threshold "predicted x_0"
+    if self.config.thresholding:
+        pred_original_sample = self._threshold_sample(pred_original_sample)
+    elif self.config.clip_sample:
+        pred_original_sample = pred_original_sample.clamp(
+            -self.config.clip_sample_range, self.config.clip_sample_range
+        )
+
+    # 5. compute variance: "sigma_t(η)" -> see formula (16)
+    # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+    variance = self._get_variance(timestep, prev_timestep)
+    std_dev_t = eta * variance ** (0.5)
+
+    if use_clipped_model_output:
+        # the pred_epsilon is always re-derived from the clipped x_0 in Glide
+        pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+
+    # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * pred_epsilon
+
+    # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    prev_sample_mean = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+
+    if variance_noise is not None and generator is not None:
+        raise ValueError(
+            "Cannot pass both generator and variance_noise. Please make sure that either `generator` or"
+            " `variance_noise` stays `None`."
+        )
+
+    if variance_noise is None:
+        variance_noise = randn_tensor(
+            model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype
+        )
+    variance = std_dev_t * variance_noise
+
+    prev_sample = prev_sample_mean + variance
+        
+    # log prob of prev_sample given prev_sample_mean and std_dev_t
+    log_prob = (
+        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
+        - torch.log(std_dev_t)
+        - torch.log(torch.sqrt(2 * torch.as_tensor(np.pi)))
+    )
+    # mean along all but batch dimension
+    log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+
+    return prev_sample, log_prob
+
+
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -953,7 +1083,7 @@ def main(args):
     )
 
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
@@ -1150,13 +1280,9 @@ def main(args):
         neg_prompt_embeds = negative_prompt_embeds.to(accelerator.device)
         neg_add_time_ids = add_time_ids.to(accelerator.device)
         neg_add_text_embeds = negative_pooled_prompt_embeds.to(accelerator.device)
-
-        # inf_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-        # inf_add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-        # inf_add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
         neg_unet_added_cond_kwargs = {"neg_text_embeds": neg_add_text_embeds, "neg_time_ids": neg_add_time_ids}
 
-        return {"prompt_embeds": prompt_embeds, "neg_prompt_embeds": neg_prompt_embeds, **unet_added_cond_kwargs, **neg_unet_added_cond_kwargs}
+        return {"prompts": prompt_batch, "prompt_embeds": prompt_embeds, "neg_prompt_embeds": neg_prompt_embeds, **unet_added_cond_kwargs, **neg_unet_added_cond_kwargs}
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory.
@@ -1285,9 +1411,13 @@ def main(args):
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
+            ###Checking!
+            print(f"STEPEPEPEPEPEPEPEPEP:{step}")
             
+            #####TODO[Done]: we generate images, latents, log_probs
+            samples = []
+            prompt_image_pairs = []
             
-            #####TODO: we generate images, latents, log_probs
             controlnet.eval()
             with torch.no_grad():
                 num_channels_latents = unet.config.in_channels
@@ -1330,10 +1460,9 @@ def main(args):
                 add_time_ids = torch.cat([batch['neg_unet_added_conditions']['time_ids'], batch['unet_added_conditions']['time_ids']], dim=0)
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 
-                ###generation: use inf_*** from batch for text prompts
+                ###generation
                 # (1) saving all latents & log_probs is needed
                 # (2) do_classifier_free_guidance=True : make it double
-                
                 for i, t in enumerate(timesteps):
                     if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
                         torch._inductor.cudagraph_mark_step_begin()
@@ -1348,24 +1477,10 @@ def main(args):
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
                         
                     # ControlNet conditioning.
-                    
-                    
-                    print(f"control_model_input.shape:{control_model_input.shape}")
-                    print(f"encoder_hidden_states.shape:{encoder_hidden_states.shape}")
-                    print(f"added_cond_kwargs['text_embeds'].shape:{added_cond_kwargs['text_embeds'].shape}")
-                    print(f"added_cond_kwargs['time_ids'].shape:{added_cond_kwargs['time_ids'].shape}")
-                    print(f"torch.cat([controlnet_image] * 2)shape:{torch.cat([controlnet_image] * 2).shape}")
-                    print(f"cond_scale.shape:{cond_scale}")
-                    # control_model_input.shape:torch.Size([2, 4, 128, 128])
-                    # batch['inf_prompt_ids'].shape:torch.Size([1, 2, 77, 2048])
-                    # batch['inf_unet_added_conditions'text_embeds'].shape:torch.Size([1, 2, 1280])
-                    # batch['inf_unet_added_conditions'].['time_ids']shape:torch.Size([1, 2, 6])
-                    # torch.cat([controlnet_image] * 2)shape:torch.Size([2, 3, 1024, 1024])
-                    
                     down_block_res_samples, mid_block_res_sample = controlnet(
-                        control_model_input, #매번
-                        t, #매번
-                        encoder_hidden_states=encoder_hidden_states,
+                        control_model_input, #매번 오는 거
+                        t, #매번 오는 거
+                        encoder_hidden_states=encoder_hidden_states, #
                         controlnet_cond=torch.cat([controlnet_image] * 2),
                         conditioning_scale=cond_scale,
                         guess_mode=False,
@@ -1389,20 +1504,20 @@ def main(args):
                     noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
-                    ### TODO:we need latents, and log_probs
-                    latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                    ### TODO:we need latents, and log_probs
+                    ### TODO[Done]:we need latents, and log_probs
+                    # latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    latents, log_probs = scheduler_step(noise_scheduler, noise_pred, t, latents, **extra_step_kwargs)
                     
-                    
-                
+                    all_latents.append(latents)
+                    all_log_probs.append(log_probs)
+                    ### TODO[Done]:we need latents, and log_probs
+
                 ### latents to image
                 needs_upcasting = vae.dtype == torch.float16 and vae.config.force_upcast
                 if needs_upcasting:
                     upcast_vae(vae)
                     latents = latents.to(next(iter(vae.post_quant_conv.parameters())).dtype)
 
-                # unscale/denormalize the latents
-                # denormalize with the mean and std if available and not None
                 has_latents_mean = hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None
                 has_latents_std = hasattr(vae.config, "latents_std") and vae.config.latents_std is not None
                 if has_latents_mean and has_latents_std:
@@ -1422,22 +1537,41 @@ def main(args):
                 if needs_upcasting:
                     vae.to(dtype=torch.float16)
                     
-                image = image_processor.postprocess(image, output_type='pil')
-                
+                images = image_processor.postprocess(image, output_type='pil')
+                #####TODO[Done]: we generate images, latents, log_probs
 
-                #####TODO: we generate images, latents, log_probs
-                
-                #####TODO: we compute rewards
-                ###computing rewards
-                ###computing rewards
-                ###computing rewards
-                #####TODO: we compute rewards
-                
-                #####TODO: turn rewards into advantages
-                ###turning it into advantages
-                ###turning it into advantages
-                ###turning it into advantages
-                #####TODO: turn rewards into advantages
+
+            ### format change for the reward part
+            latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, ...)
+            log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
+            timesteps = noise_scheduler.timesteps.repeat(args.train_batch_size, 1)  # (batch_size, num_steps)
+
+            samples.append(
+                {
+                    "prompts": batch["prompts"],
+                    "latents": latents[:, :-1],
+                    "next_latents": latents[:, 1:],
+                    "timesteps": timesteps,
+                    "encoder_hidden_states": batch["prompt_ids"], 
+                    "conditioning_pixel_values": controlnet_image,
+                    "text_embeds": batch["unet_added_conditions"]["text_embeds"],
+                    "time_ids": batch["unet_added_conditions"]["time_ids"],
+                    "log_probs": log_probs,
+                }
+            )
+            prompt_image_pairs.append([images, batch["prompts"], {}])
+            torch.cuda.empty_cache()
+            #####TODO: we compute rewards
+            ###computing rewards
+            ###computing rewards
+            ###computing rewards
+            #####TODO: we compute rewards
+            
+            #####TODO: turn rewards into advantages
+            ###turning it into advantages
+            ###turning it into advantages
+            ###turning it into advantages
+            #####TODO: turn rewards into advantages
                               
                               
                               
