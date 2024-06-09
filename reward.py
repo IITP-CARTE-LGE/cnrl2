@@ -3,6 +3,7 @@ import torch.nn as nn
 from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration, BitsAndBytesConfig, AutoImageProcessor, AutoModel
 from bert_score import BERTScorer
 from controlnet_aux import OpenposeDetector
+from tqdm import tqdm
 
 
 class AlignmentScorer(torch.nn.Module):
@@ -63,17 +64,20 @@ class RewardComputation():
         self.alignment_scorer = AlignmentScorer(self.device)
         self.pose_scorer = PoseScorer(self.device)
 
-    def reward_fn(images, prompts, metadata):
-        alignment_scores = alignment_scorer(images, prompts)
-        pose_scores = pose_scorer(images, prompts)
+    def reward_fn(self, images, prompts, metadata):
+        alignment_scores = self.alignment_scorer(images, prompts)
+        pose_scores = self.pose_scorer(images, prompts)
         scores = alignment_scores + pose_scores
         return scores, {}
 
     def compute_rewards(self, prompt_image_pairs):
-        rewards = self.executor.map(lambda x: self.reward_fn(*x), prompt_image_pairs)
-        rewards = [
-            (torch.as_tensor(reward.result(), device=self.device), reward_metadata.result())
-            for reward, reward_metadata in rewards
-        ]
-        torch.cuda.empty_cache()
+        rewards = []
+        for images, prompts, prompt_metadata in tqdm(prompt_image_pairs):
+            reward, reward_metadata = self.reward_fn(images, prompts, prompt_metadata)
+            rewards.append(
+                (
+                    torch.as_tensor(reward, device=self.device),
+                    reward_metadata,
+                )
+            )
         return zip(*rewards)

@@ -3,7 +3,7 @@ export NCCL_P2P_DISABLE=1
 export MODEL_DIR="stabilityai/stable-diffusion-xl-base-1.0"
 export OUTPUT_DIR="./save"
 
-accelerate launch --config_file ./ac_config.yaml train_controlnet_sdxl.py \
+accelerate launch --config_file ./ac_config.yaml --main_process_port 10000 train_controlnet_sdxl.py \
  --pretrained_model_name_or_path=$MODEL_DIR \
  --pretrained_vae_model_name_or_path madebyollin/sdxl-vae-fp16-fix \
  --controlnet_model_name_or_path thibaud/controlnet-openpose-sdxl-1.0 \
