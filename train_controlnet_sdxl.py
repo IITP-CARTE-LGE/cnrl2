@@ -42,6 +42,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+from reward import RewardComputation
 
 import diffusers
 from diffusers import (
@@ -832,6 +833,46 @@ def collate_fn(examples):
         "neg_unet_added_conditions": {"text_embeds": neg_add_text_embeds, "time_ids": neg_add_time_ids},
     }
 
+def calculate_loss(latents, timesteps, next_latents, log_probs, advantages, conditioning_pixel_values, prompt_embeds, text_embeds, time_ids):
+    """
+    Calculate the loss for a batch of an unpacked sample
+
+    Args:
+        latents (torch.Tensor):
+            The latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+        timesteps (torch.Tensor):
+            The timesteps sampled from the diffusion model, shape: [batch_size]
+        next_latents (torch.Tensor):
+            The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+        log_probs (torch.Tensor):
+            The log probabilities of the latents, shape: [batch_size]
+        advantages (torch.Tensor):
+            The advantages of the latents, shape: [batch_size]
+        embeds (torch.Tensor):
+            The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
+            Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
+
+    Returns:
+        loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
+        (all of these are of shape (1,))
+    """
+
+
+    return loss, approx_kl, clipfrac
+
+def loss_(
+    advantages: torch.Tensor,
+    clip_range: float,
+    ratio: torch.Tensor,
+):
+    unclipped_loss = -advantages * ratio
+    clipped_loss = -advantages * torch.clamp(
+        ratio,
+        1.0 - clip_range,
+        1.0 + clip_range,
+    )
+    return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
 def prepare_extra_step_kwargs(scheduler, generator, eta):
     # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
     # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
@@ -1021,8 +1062,9 @@ def main(args):
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    num_train_timesteps = int(args.num_train_inference_steps * 1.0) #(config.sample_num_steps ,config.train_timestep_fraction)
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps * num_train_timesteps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
@@ -1112,6 +1154,7 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
 
+    reward_computation = RewardComputation(accelerator.device)
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
     
@@ -1437,7 +1480,7 @@ def main(args):
                 ###preparing timesteps
                 noise_scheduler.set_timesteps(args.num_train_inference_steps, device=latents.device)
                 timesteps = noise_scheduler.timesteps        
-                extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, None, 0.0) #scheduler, generator, eta
+                extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, None, 1.0) #scheduler, generator, eta
                 
                 ### for cond_scale
                 controlnet_keep = []
@@ -1503,7 +1546,6 @@ def main(args):
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                    # compute the previous noisy sample x_t -> x_t-1
                     ### TODO[Done]:we need latents, and log_probs
                     # latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
                     latents, log_probs = scheduler_step(noise_scheduler, noise_pred, t, latents, **extra_step_kwargs)
@@ -1538,6 +1580,8 @@ def main(args):
                     vae.to(dtype=torch.float16)
                     
                 images = image_processor.postprocess(image, output_type='pil')
+                images[0].save(f'./step_{step}_0.png')
+                images[1].save(f'./step_{step}_1.png')
                 #####TODO[Done]: we generate images, latents, log_probs
 
 
@@ -1561,177 +1605,269 @@ def main(args):
             )
             prompt_image_pairs.append([images, batch["prompts"], {}])
             torch.cuda.empty_cache()
-            #####TODO: we compute rewards
-            ###computing rewards
-            ###computing rewards
-            ###computing rewards
+
+                    # ### TODO:we need latents, and log_probs
+                    # latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+
+            #####TODO: we generate images, latents, log_probs
+            
+            #####TODO (DONE): we compute rewards
+            # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)            
+            samples = {k: torch.cat([s[k] for s in samples]) if k != "prompts" else [s[k] for s in samples] for k in samples[0].keys()}
+            rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_pairs)
             #####TODO: we compute rewards
             
             #####TODO: turn rewards into advantages
-            ###turning it into advantages
-            ###turning it into advantages
-            ###turning it into advantages
+            for i, image_data in enumerate(prompt_image_pairs):
+                image_data.extend([rewards[i], rewards_metadata[i]])
+
+            # if self.image_samples_callback is not None:
+            #     self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
+            rewards = torch.cat(rewards)
+            rewards = accelerator.gather(rewards).cpu().numpy()
+
+            accelerator.log(
+                {
+                    "reward": rewards,
+                    "epoch": epoch,
+                    "reward_mean": rewards.mean(),
+                    "reward_std": rewards.std(),
+                },
+                step=global_step,
+            )
+
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+            # ungather advantages;  keep the entries corresponding to the samples on this process
+            samples["advantages"] = (
+                torch.as_tensor(advantages)
+                .reshape(accelerator.num_processes, -1)[accelerator.process_index]
+                .to(accelerator.device)
+            )
+
+            # TODO check here
+            del samples["prompts"]
+
+            total_batch_size_, num_timesteps = samples["timesteps"].shape
+
+            ##########TODO HERE TO BE MODIFIED : for loop removed from here
+            # shuffle samples along batch dimension
+            perm = torch.randperm(total_batch_size_, device=accelerator.device)
+            _samples = {}
+            for k, v in samples.items():
+                v = v.to(accelerator.device)
+                _samples[k] = v[perm]
+            samples = _samples
+
+            # shuffle along time dimension independently for each sample
+            # still trying to understand the code below
+            perms = torch.stack(
+                [torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)]
+            )
+
+            for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                samples[key] = samples[key][
+                    torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                    perms,
+                ]
+
+            original_keys = samples.keys()
+            original_values = samples.values()
+            # rebatch them as user defined train_batch_size is different from sample_batch_size
+
+            reshaped_values = [v.reshape(-1, args.train_batch_size *v.shape[1:]) for v in original_values]
+
+            # Transpose the list of original values
+            transposed_values = zip(*reshaped_values)
+            samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
             #####TODO: turn rewards into advantages
-                              
-                              
-                              
-                              
-#             # with accelerator.accumulate(controlnet):
-#                 ###hoxy..?           
-#                 # Convert images to latent space
-#                 if args.pretrained_vae_model_name_or_path is not None:
-#                     pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-#                 else:
-#                     pixel_values = batch["pixel_values"]
-#                 latents = vae.encode(pixel_values).latent_dist.sample()
-#                 latents = latents * vae.config.scaling_factor
-#                 if args.pretrained_vae_model_name_or_path is None:
-#                     latents = latents.to(weight_dtype)
-                    
-                    
-                    
-                              
-#                 #####TODO: we calculate loss
-#                 # Sample noise that we'll add to the latents
-#                 noise = torch.randn_like(latents)
-#                 bsz = latents.shape[0]
+                            
+                            
+        #####TODO: we calculate loss
+        controlnet.train()
+        info = defaultdict(list)
+        for _i, sample in tqdm(enumerate(bsamples_batched)):
+            for j in range(num_train_timesteps):
+                with accelerator.accumulate(controlnet):
+                    latents = sample["latents"][:, j] 
+                    timesteps = sample["timesteps"][:, j]
+                    next_latents = sample["next_latents"][:, j]
+                    log_probs = sample["log_probs"][:, j]
+                    advantages = sample["advantages"]
+                    conditioning_pixel_values = sample["conditioning_pixel_values"]
+                    prompt_embeds = sample["prompt_embeds"]
+                    text_embeds = sample["text_embeds"]
+                    time_ids = sample["time_ids"]
 
-#                 # Sample a random timestep for each image
-#                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-#                 timesteps = timesteps.long()
+                    with accelerator.autocast():
+                        controlnet_image = conditioning_pixel_values.to(dtype=args.mixed_precision)
+                        unet_added_conditions = {"text_embeds" : torch.cat([text_embeds] * 2), "time_ids" : torch.cat([time_ids] * 2)}
+                        down_block_res_samples, mid_block_res_sample = controlnet(
+                            torch.cat([latents] * 2),
+                            torch.cat([timesteps] * 2),
+                            encoder_hidden_states=torch.cat([prompt_embeds] * 2),
+                            added_cond_kwargs=unet_added_conditions,
+                            controlnet_cond=torch.cat([controlnet_image] * 2),
+                            return_dict=False,
+                        )
+                        noise_pred = unet(
+                            torch.cat([latents] * 2),
+                            torch.cat([timesteps] * 2),
+                            encoder_hidden_states=torch.cat([prompt_embeds] * 2),
+                            added_cond_kwargs=unet_added_conditions,
+                            down_block_additional_residuals=[
+                                sample.to(dtype=args.mixed_precision) for sample in down_block_res_samples
+                            ],
+                            mid_block_additional_residual=mid_block_res_sample.to(dtype=args.mixed_precision),
+                            return_dict=False
+                        )[0]
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
+                            noise_pred_text - noise_pred_uncond
+                        )
 
-#                 # Add noise to the latents according to the noise magnitude at each timestep
-#                 # (this is the forward diffusion process)
-#                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                        # TODO: Change
+                        scheduler_step_output = scheduler_step(
+                            noise_pred,
+                            timesteps,
+                            latents,
+                            eta=self.config.sample_eta,
+                            variance_noise=next_latents,
+                        )
 
-#                 # ControlNet conditioning.
-#                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-#                 down_block_res_samples, mid_block_res_sample = controlnet(
-#                     noisy_latents,
-#                     timesteps,
-#                     encoder_hidden_states=batch["prompt_ids"],
-#                     added_cond_kwargs=batch["unet_added_conditions"],
-#                     controlnet_cond=controlnet_image,
-#                     return_dict=False,
-#                 )
+                        log_prob = scheduler_step_output.log_probs
 
-#                 # Predict the noise residual
-#                 model_pred = unet(
-#                     noisy_latents,
-#                     timesteps,
-#                     encoder_hidden_states=batch["prompt_ids"],
-#                     added_cond_kwargs=batch["unet_added_conditions"],
-#                     down_block_additional_residuals=[
-#                         sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-#                     ],
-#                     mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-#                     return_dict=False,
-#                 )[0]
-                
-#                 # Get the target for loss depending on the prediction type
-#                 if noise_scheduler.config.prediction_type == "epsilon":
-#                     target = noise
-#                 elif noise_scheduler.config.prediction_type == "v_prediction":
-#                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
-#                 else:
-#                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-#                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    advantages = torch.clamp(
+                        advantages,
+                        -self.config.train_adv_clip_max,
+                        self.config.train_adv_clip_max,
+                    )
 
-#                 accelerator.backward(loss)
-#                 if accelerator.sync_gradients:
-#                     params_to_clip = controlnet.parameters()
-#                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-#                 optimizer.step()
-#                 lr_scheduler.step()
-#                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-#                 #####TODO: we calculate loss
+                    ratio = torch.exp(log_prob - log_probs)
 
-#             # Checks if the accelerator has performed an optimization step behind the scenes
-#             if accelerator.sync_gradients:
-#                 progress_bar.update(1)
-#                 global_step += 1
+                    loss = loss_(advantages, self.config.train_clip_range, ratio)
 
-#                 # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
-#                 if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
-#                     if global_step % args.checkpointing_steps == 0:
-#                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-#                         if args.checkpoints_total_limit is not None:
-#                             checkpoints = os.listdir(args.output_dir)
-#                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-#                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                    approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
 
-#                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-#                             if len(checkpoints) >= args.checkpoints_total_limit:
-#                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-#                                 removing_checkpoints = checkpoints[0:num_to_remove]
+                    clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
 
-#                                 logger.info(
-#                                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-#                                 )
-#                                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
-#                                 for removing_checkpoint in removing_checkpoints:
-#                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-#                                     shutil.rmtree(removing_checkpoint)
+                    info["approx_kl"].append(approx_kl)
+                    info["clipfrac"].append(clipfrac)
+                    info["loss"].append(loss)
 
-#                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-#                         accelerator.save_state(save_path)
-#                         logger.info(f"Saved state to {save_path}")
+                    accelerator.backward(loss)
+                    # changed this ----- trainable_layers (deleted)
+                    if accelerator.sync_gradients:
+                        params_to_clip = controlnet.parameters()
+                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-#                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-#                         image_logs = log_validation(
-#                             vae=vae,
-#                             unet=unet,
-#                             controlnet=controlnet,
-#                             args=args,
-#                             accelerator=accelerator,
-#                             weight_dtype=weight_dtype,
-#                             step=global_step,
-#                         )
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
-#             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-#             progress_bar.set_postfix(**logs)
-#             accelerator.log(logs, step=global_step)
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                ################# TODO: need to check here
+                if accelerator.sync_gradients:
+                    # log training-related stuff
+                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                    info = accelerator.reduce(info, reduction="mean")
+                    info.update({"epoch": epoch})
+                    accelerator.log(info, step=global_step)
+                    global_step += 1
+                    info = defaultdict(list)
 
-#             if global_step >= args.max_train_steps:
-#                 break
+            #####TODO: we calculate loss
 
-#     # Create the pipeline using using the trained modules and save it.
-#     accelerator.wait_for_everyone()
-#     if accelerator.is_main_process:
-#         controlnet = unwrap_model(controlnet)
-#         controlnet.save_pretrained(args.output_dir)
+###########Newly added codes end here###########
 
-#         # Run a final round of validation.
-#         # Setting `vae`, `unet`, and `controlnet` to None to load automatically from `args.output_dir`.
-#         image_logs = None
-#         if args.validation_prompt is not None:
-#             image_logs = log_validation(
-#                 vae=None,
-#                 unet=None,
-#                 controlnet=None,
-#                 args=args,
-#                 accelerator=accelerator,
-#                 weight_dtype=weight_dtype,
-#                 step=global_step,
-#                 is_final_validation=True,
-#             )
+        # Checks if the accelerator has performed an optimization step behind the scenes
+                # if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    # global_step += 1
 
-#         if args.push_to_hub:
-#             save_model_card(
-#                 repo_id,
-#                 image_logs=image_logs,
-#                 base_model=args.pretrained_model_name_or_path,
-#                 repo_folder=args.output_dir,
-#             )
-#             upload_folder(
-#                 repo_id=repo_id,
-#                 folder_path=args.output_dir,
-#                 commit_message="End of training",
-#                 ignore_patterns=["step_*", "epoch_*"],
-#             )
+                    # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
+                    if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
+                        if global_step % args.checkpointing_steps == 0:
+                            # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                            if args.checkpoints_total_limit is not None:
+                                checkpoints = os.listdir(args.output_dir)
+                                checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                                checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-#     accelerator.end_training()
+                                # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                                if len(checkpoints) >= args.checkpoints_total_limit:
+                                    num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                    removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                    logger.info(
+                                        f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                    )
+                                    logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                    for removing_checkpoint in removing_checkpoints:
+                                        removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                        shutil.rmtree(removing_checkpoint)
+
+                            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                            accelerator.save_state(save_path)
+                            logger.info(f"Saved state to {save_path}")
+
+                        if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                            image_logs = log_validation(
+                                vae=vae,
+                                unet=unet,
+                                controlnet=controlnet,
+                                args=args,
+                                accelerator=accelerator,
+                                weight_dtype=weight_dtype,
+                                step=global_step,
+                            )
+
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+
+                if global_step >= args.max_train_steps:
+                    break
+
+    # Create the pipeline using using the trained modules and save it.
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        controlnet = unwrap_model(controlnet)
+        controlnet.save_pretrained(args.output_dir)
+
+        # Run a final round of validation.
+        # Setting `vae`, `unet`, and `controlnet` to None to load automatically from `args.output_dir`.
+        image_logs = None
+        if args.validation_prompt is not None:
+            image_logs = log_validation(
+                vae=None,
+                unet=None,
+                controlnet=None,
+                args=args,
+                accelerator=accelerator,
+                weight_dtype=weight_dtype,
+                step=global_step,
+                is_final_validation=True,
+            )
+
+        if args.push_to_hub:
+            save_model_card(
+                repo_id,
+                image_logs=image_logs,
+                base_model=args.pretrained_model_name_or_path,
+                repo_folder=args.output_dir,
+            )
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
