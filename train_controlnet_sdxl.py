@@ -16,6 +16,7 @@
 import argparse
 import functools
 import gc
+import inspect
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ import random
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
+import copy
 
 import accelerate
 import numpy as np
@@ -51,12 +53,21 @@ from diffusers import (
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_torch_npu_available, is_xformers_available
-from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.utils.torch_utils import is_compiled_module, is_torch_version, randn_tensor
+from diffusers.models.attention_processor import (
+    AttnProcessor2_0,
+    LoRAAttnProcessor2_0,
+    LoRAXFormersAttnProcessor,
+    XFormersAttnProcessor,
+)
 
+# import deepspeed
+# deepspeed.ops.op_builder.CPUAdamBuilder().load()
 
 if is_wandb_available():
     import wandb
@@ -340,6 +351,18 @@ def parse_args(input_args=None):
         type=int,
         default=None,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--num_train_inference_steps",
+        type=int,
+        default=30,
+        help="Number of inference steps when training.",
+    )
+    parser.add_argument(
+        "--train_inference_guidance_scale", #guidance_scale
+        type=float,
+        default=5.0,
+        help="Guidance scale of inference when training.",
     )
     parser.add_argument(
         "--checkpointing_steps",
@@ -650,7 +673,7 @@ def get_train_dataset(args, accelerator):
             #     args.train_data_dir,
             #     cache_dir=args.cache_dir,
             # )
-            dataset = load_dataset("json", data_files=args.train_data_dir)
+            dataset = load_dataset("json", data_files=args.train_data_dir, cache_dir="./")
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
@@ -730,10 +753,20 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
-
+            
+    
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-    return prompt_embeds, pooled_prompt_embeds
+    
+    ### consumed negative prompts to be zero_out=True
+    negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+    negative_pooled_prompt_embeds = torch.zeros_like(pooled_prompt_embeds)
+    # negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    # negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+    # negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+    #     bs_embed * num_images_per_prompt, -1
+    # )
+    return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
 
 def prepare_train_dataset(dataset, accelerator):
@@ -771,7 +804,6 @@ def prepare_train_dataset(dataset, accelerator):
 
     return dataset
 
-
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -784,11 +816,27 @@ def collate_fn(examples):
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
+    ### text embeddings for inference
+
+    # inf_prompt_ids = torch.stack([torch.cat([torch.tensor(example["neg_prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1), torch.tensor(example["prompt_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1, 1)], dim=0)  for example in examples])
+    # inf_add_text_embeds = torch.stack([torch.cat([torch.tensor(example["neg_text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["text_embeds"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
+    # inf_add_time_ids = torch.stack([torch.cat([torch.tensor(example["neg_time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1), torch.tensor(example["time_ids"]).unsqueeze(0).repeat(args.train_batch_size, 1)], dim=0)  for example in examples])
+    neg_prompt_ids = torch.stack([torch.tensor(example["neg_prompt_embeds"]) for example in examples])
+    neg_add_text_embeds = torch.stack([torch.tensor(example["neg_text_embeds"]) for example in examples])
+    neg_add_time_ids =  torch.stack([torch.tensor(example["neg_time_ids"]) for example in examples])
+    
+    # inf_prompt_ids = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_prompt_ids, prompt_ids)])
+    # inf_add_text_embeds = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_add_text_embeds, add_text_embeds)])
+    # inf_add_time_ids = torch.stack([torch.cat([n, p], dim=0) for n, p in zip(neg_add_time_ids, add_time_ids)])
+
+    
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
+        "neg_prompt_ids": neg_prompt_ids,
         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
+        "neg_unet_added_conditions": {"text_embeds": neg_add_text_embeds, "time_ids": neg_add_time_ids},
     }
 
 def calculate_loss(latents, timesteps, next_latents, log_probs, advantages, conditioning_pixel_values, prompt_embeds, text_embeds, time_ids):
@@ -831,6 +879,42 @@ def loss_(
     )
     return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
+def prepare_extra_step_kwargs(scheduler, generator, eta):
+    # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+    # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+    # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+    # and should be between [0, 1]
+
+    accepts_eta = "eta" in set(inspect.signature(scheduler.step).parameters.keys())
+    extra_step_kwargs = {}
+    if accepts_eta:
+        extra_step_kwargs["eta"] = eta
+
+    # check if the scheduler accepts generator
+    accepts_generator = "generator" in set(inspect.signature(scheduler.step).parameters.keys())
+    if accepts_generator:
+        extra_step_kwargs["generator"] = generator
+    return extra_step_kwargs
+
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_upscale.StableDiffusionUpscalePipeline.upcast_vae
+def upcast_vae(vae):
+    dtype = vae.dtype
+    vae.to(dtype=torch.float32)
+    use_torch_2_0_or_xformers = isinstance(
+        vae.decoder.mid_block.attentions[0].processor,
+        (
+            AttnProcessor2_0,
+            XFormersAttnProcessor,
+            LoRAXFormersAttnProcessor,
+            LoRAAttnProcessor2_0,
+        ),
+    )
+    # if xformers or torch_2_0 is used attention block does not need
+    # to be in float32 which can save lots of memory
+    if use_torch_2_0_or_xformers:
+        vae.post_quant_conv.to(dtype)
+        vae.decoder.conv_in.to(dtype)
+        vae.decoder.mid_block.to(dtype)
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -848,8 +932,9 @@ def main(args):
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    num_train_timesteps = int(num_train_inference_steps * 1.0) #(config.sample_num_steps ,config.train_timestep_fraction)
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps * num_train_timesteps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
@@ -886,7 +971,7 @@ def main(args):
             repo_id = create_repo(
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
-
+    
     # Load the tokenizers
     tokenizer_one = AutoTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -940,6 +1025,16 @@ def main(args):
         controlnet = ControlNetModel.from_unet(unet)
 
     reward_computation = RewardComputation(accelerator.device)
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
+    
+    
+    #####TODO: Initialize Reward Model
+    ###reward model initialize
+    ###reward model initialize
+    ###reward model initialize
+    #####TODO: Initialize Reward Model
+    
     
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1078,12 +1173,13 @@ def main(args):
         crops_coords_top_left = (args.crops_coords_top_left_h, args.crops_coords_top_left_w)
         prompt_batch = batch[args.caption_column]
 
-        prompt_embeds, pooled_prompt_embeds = encode_prompt(
+        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encode_prompt(
             prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train
         )
         add_text_embeds = pooled_prompt_embeds
 
         # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+        ### this is for training
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
         add_time_ids = torch.tensor([add_time_ids])
 
@@ -1092,8 +1188,18 @@ def main(args):
         add_time_ids = add_time_ids.repeat(len(prompt_batch), 1)
         add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
         unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+        
+        ### this is for inference
+        neg_prompt_embeds = negative_prompt_embeds.to(accelerator.device)
+        neg_add_time_ids = add_time_ids.to(accelerator.device)
+        neg_add_text_embeds = negative_pooled_prompt_embeds.to(accelerator.device)
 
-        return {"prompt_embeds": prompt_embeds, **unet_added_cond_kwargs}
+        # inf_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        # inf_add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+        # inf_add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+        neg_unet_added_cond_kwargs = {"neg_text_embeds": neg_add_text_embeds, "neg_time_ids": neg_add_time_ids}
+
+        return {"prompt_embeds": prompt_embeds, "neg_prompt_embeds": neg_prompt_embeds, **unet_added_cond_kwargs, **neg_unet_added_cond_kwargs}
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory.
@@ -1122,7 +1228,6 @@ def main(args):
 
     # Then get the training dataset ready to be passed to the dataloader.
     train_dataset = prepare_train_dataset(train_dataset, accelerator)
-
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -1130,6 +1235,7 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1222,31 +1328,119 @@ def main(args):
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(controlnet):
-                # Convert images to latent space
-                if args.pretrained_vae_model_name_or_path is not None:
-                    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-                else:
-                    pixel_values = batch["pixel_values"]
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-                if args.pretrained_vae_model_name_or_path is None:
-                    latents = latents.to(weight_dtype)
+            
+            
+            #####TODO: we generate images, latents, log_probs
+            controlnet.eval()
+            with torch.no_grad():
+                num_channels_latents = unet.config.in_channels
+                shape = (
+                    args.train_batch_size,
+                    num_channels_latents,
+                    unet.config.sample_size,
+                    unet.config.sample_size
+                )
+                
+                ### preparing latents
+                latents = randn_tensor(shape, device=accelerator.device, dtype=weight_dtype) #add generator if needed, device needs to be checked
+                latents = latents * noise_scheduler.init_noise_sigma
+                all_latents = [latents]
+                all_log_probs = []
+                
+                ###preparing timesteps
+                noise_scheduler.set_timesteps(args.num_train_inference_steps, device=latents.device)
+                timesteps = noise_scheduler.timesteps        
+                extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, None, 0.0) #scheduler, generator, eta
+                
+                ### for cond_scale
+                controlnet_keep = []
+                for i in range(len(timesteps)):
+                    keeps = [
+                        1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
+                        for s, e in zip([0.0], [1.0])
+                    ]
+                    controlnet_keep.append(keeps[0])
+                
+                
+                is_unet_compiled = is_compiled_module(unet)
+                is_controlnet_compiled = is_compiled_module(controlnet)
+                is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
+                
+                ### preparing encoder_hidden_states, controlnet_cond, added_cond_kwargs from dataloader
+                encoder_hidden_states = torch.cat([batch["neg_prompt_ids"], batch["prompt_ids"]], dim=0)
+                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                add_text_embeds = torch.cat([batch['neg_unet_added_conditions']['text_embeds'], batch['unet_added_conditions']['text_embeds']], dim=0)
+                add_time_ids = torch.cat([batch['neg_unet_added_conditions']['time_ids'], batch['unet_added_conditions']['time_ids']], dim=0)
+                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                
+                ###generation: use inf_*** from batch for text prompts
+                # (1) saving all latents & log_probs is needed
+                # (2) do_classifier_free_guidance=True : make it double
+                
+                for i, t in enumerate(timesteps):
+                    if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
+                        torch._inductor.cudagraph_mark_step_begin()
+                    latent_model_input = torch.cat([latents] * 2)
+                    latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+                    
+                    control_model_input = latent_model_input
+                
+                    controlnet_cond_scale = 1.0
+                    if isinstance(controlnet_cond_scale, list):
+                        controlnet_cond_scale = controlnet_cond_scale[0]
+                    cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                        
+                    # ControlNet conditioning.
+                    
+                    
+                    print(f"control_model_input.shape:{control_model_input.shape}")
+                    print(f"encoder_hidden_states.shape:{encoder_hidden_states.shape}")
+                    print(f"added_cond_kwargs['text_embeds'].shape:{added_cond_kwargs['text_embeds'].shape}")
+                    print(f"added_cond_kwargs['time_ids'].shape:{added_cond_kwargs['time_ids'].shape}")
+                    print(f"torch.cat([controlnet_image] * 2)shape:{torch.cat([controlnet_image] * 2).shape}")
+                    print(f"cond_scale.shape:{cond_scale}")
+                    # control_model_input.shape:torch.Size([2, 4, 128, 128])
+                    # batch['inf_prompt_ids'].shape:torch.Size([1, 2, 77, 2048])
+                    # batch['inf_unet_added_conditions'text_embeds'].shape:torch.Size([1, 2, 1280])
+                    # batch['inf_unet_added_conditions'].['time_ids']shape:torch.Size([1, 2, 6])
+                    # torch.cat([controlnet_image] * 2)shape:torch.Size([2, 3, 1024, 1024])
+                    
+                    down_block_res_samples, mid_block_res_sample = controlnet(
+                        control_model_input, #매번
+                        t, #매번
+                        encoder_hidden_states=encoder_hidden_states,
+                        controlnet_cond=torch.cat([controlnet_image] * 2),
+                        conditioning_scale=cond_scale,
+                        guess_mode=False,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )
 
-                
-                
-                #####TODO: we generate images, latents, log_probs
-                ###generation
-                ###generation
-                ###generation
+                    noise_pred = unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=encoder_hidden_states,
+                        timestep_cond=None,
+                        cross_attention_kwargs=None,
+                        added_cond_kwargs=added_cond_kwargs,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                        return_dict=False,
+                    )[0]
+                    
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    ### TODO:we need latents, and log_probs
+                    latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+
                 #####TODO: we generate images, latents, log_probs
                 
                 #####TODO (DONE): we compute rewards
                 # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)            
                 samples = {k: torch.cat([s[k] for s in samples]) if k != "prompts" else [s[k] for s in samples] for k in samples[0].keys()}
-                rewards, rewards_metadata = self.compute_rewards(
-                    prompt_image_data, is_async=self.config.async_reward_computation
-                )
                 rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_data)
                 #####TODO: we compute rewards
                 
@@ -1278,6 +1472,7 @@ def main(args):
                     .to(accelerator.device)
                 )
 
+                # TODO check here
                 del samples["prompts"]
 
                 total_batch_size, num_timesteps = samples["timesteps"].shape
@@ -1310,22 +1505,20 @@ def main(args):
 
                 # Transpose the list of original values
                 transposed_values = zip(*reshaped_values)
+                samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
                 #####TODO: turn rewards into advantages
-                              
                               
                               
                 #####TODO: we calculate loss
                 # samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
                 # self.sd_pipeline.controlnet.train()
                 # global_step = self._train_batched_samples(epoch, global_step, samples_batched)
-
+            controlnet.train()
             info = defaultdict(list)
             for _i, sample in tqdm(enumerate(batched_samples)):
-                #### TODO adding negative prompt
-                # concat negative prompts to sample prompts to avoid two forward passes
-                #     embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
 
-                for j in range(self.num_train_timesteps):
+        # self.num_train_timesteps = int(self.config.sample_num_steps * self.config.train_timestep_fraction)
+                for j in range(num_train_timesteps):
                     with accelerator.accumulate(controlnet):
                         latents = sample["latents"][:, j] 
                         timesteps = sample["timesteps"][:, j]
@@ -1364,6 +1557,7 @@ def main(args):
                                 noise_pred_text - noise_pred_uncond
                             )
 
+                            # TODO: Change
                             scheduler_step_output = self.sd_pipeline.scheduler_step(
                                 noise_pred,
                                 timesteps,
@@ -1408,7 +1602,7 @@ def main(args):
                     if accelerator.sync_gradients:
                         # log training-related stuff
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                        info = self.accelerator.reduce(info, reduction="mean")
+                        info = accelerator.reduce(info, reduction="mean")
                         info.update({"epoch": epoch})
                         accelerator.log(info, step=global_step)
                         global_step += 1
@@ -1419,54 +1613,54 @@ def main(args):
     ###########Newly added codes end here###########
 
             # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
+                    # if accelerator.sync_gradients:
+                        progress_bar.update(1)
+                        # global_step += 1
 
-                # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
-                if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
-                    if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                        # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
+                        if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
+                            if global_step % args.checkpointing_steps == 0:
+                                # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                                if args.checkpoints_total_limit is not None:
+                                    checkpoints = os.listdir(args.output_dir)
+                                    checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
+                                    # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                                    if len(checkpoints) >= args.checkpoints_total_limit:
+                                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                        removing_checkpoints = checkpoints[0:num_to_remove]
 
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                        logger.info(
+                                            f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                        )
+                                        logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                        for removing_checkpoint in removing_checkpoints:
+                                            removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                            shutil.rmtree(removing_checkpoint)
+
+                                save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                                accelerator.save_state(save_path)
+                                logger.info(f"Saved state to {save_path}")
+
+                            if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                                image_logs = log_validation(
+                                    vae=vae,
+                                    unet=unet,
+                                    controlnet=controlnet,
+                                    args=args,
+                                    accelerator=accelerator,
+                                    weight_dtype=weight_dtype,
+                                    step=global_step,
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                    logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                    progress_bar.set_postfix(**logs)
+                    accelerator.log(logs, step=global_step)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
-                            vae=vae,
-                            unet=unet,
-                            controlnet=controlnet,
-                            args=args,
-                            accelerator=accelerator,
-                            weight_dtype=weight_dtype,
-                            step=global_step,
-                        )
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
-
-            if global_step >= args.max_train_steps:
-                break
+                    if global_step >= args.max_train_steps:
+                        break
 
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
