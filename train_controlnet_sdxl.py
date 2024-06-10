@@ -25,6 +25,7 @@ import shutil
 from contextlib import nullcontext
 from pathlib import Path
 import copy
+from collections import defaultdict
 
 import accelerate
 import numpy as np
@@ -614,6 +615,10 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+
+    parser.add_argument("--train_clip_range", type=float, default=1e-4, help="Clip range")
+    parser.add_argument("--train_adv_clip_max", type=float, default=5, help="Clip advantages to the range")
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1580,8 +1585,8 @@ def main(args):
                     vae.to(dtype=torch.float16)
                     
                 images = image_processor.postprocess(image, output_type='pil')
-                images[0].save(f'./step_{step}_0.png')
-                images[1].save(f'./step_{step}_1.png')
+                # images[0].save(f'./step_{step}_0.png')
+                # images[1].save(f'./step_{step}_1.png')
                 #####TODO[Done]: we generate images, latents, log_probs
 
 
@@ -1596,10 +1601,10 @@ def main(args):
                     "latents": latents[:, :-1],
                     "next_latents": latents[:, 1:],
                     "timesteps": timesteps,
-                    "encoder_hidden_states": batch["prompt_ids"], 
+                    "encoder_hidden_states": encoder_hidden_states, 
                     "conditioning_pixel_values": controlnet_image,
-                    "text_embeds": batch["unet_added_conditions"]["text_embeds"],
-                    "time_ids": batch["unet_added_conditions"]["time_ids"],
+                    "text_embeds": add_text_embeds,
+                    "time_ids": add_time_ids,
                     "log_probs": log_probs,
                 }
             )
@@ -1627,6 +1632,7 @@ def main(args):
             rewards = torch.cat(rewards)
             rewards = accelerator.gather(rewards).cpu().numpy()
 
+
             accelerator.log(
                 {
                     "reward": rewards,
@@ -1636,7 +1642,6 @@ def main(args):
                 },
                 step=global_step,
             )
-
             advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
             # ungather advantages;  keep the entries corresponding to the samples on this process
@@ -1675,8 +1680,7 @@ def main(args):
             original_keys = samples.keys()
             original_values = samples.values()
             # rebatch them as user defined train_batch_size is different from sample_batch_size
-
-            reshaped_values = [v.reshape(-1, args.train_batch_size *v.shape[1:]) for v in original_values]
+            reshaped_values = [v.reshape(-1, args.train_batch_size, *v.shape[1:]) for v in original_values]
 
             # Transpose the list of original values
             transposed_values = zip(*reshaped_values)
@@ -1684,190 +1688,187 @@ def main(args):
             #####TODO: turn rewards into advantages
                             
                             
-        #####TODO: we calculate loss
-        controlnet.train()
-        info = defaultdict(list)
-        for _i, sample in tqdm(enumerate(bsamples_batched)):
-            for j in range(num_train_timesteps):
-                with accelerator.accumulate(controlnet):
-                    latents = sample["latents"][:, j] 
-                    timesteps = sample["timesteps"][:, j]
-                    next_latents = sample["next_latents"][:, j]
-                    log_probs = sample["log_probs"][:, j]
-                    advantages = sample["advantages"]
-                    conditioning_pixel_values = sample["conditioning_pixel_values"]
-                    prompt_embeds = sample["prompt_embeds"]
-                    text_embeds = sample["text_embeds"]
-                    time_ids = sample["time_ids"]
-
-                    with accelerator.autocast():
-                        controlnet_image = conditioning_pixel_values.to(dtype=args.mixed_precision)
-                        unet_added_conditions = {"text_embeds" : torch.cat([text_embeds] * 2), "time_ids" : torch.cat([time_ids] * 2)}
-                        down_block_res_samples, mid_block_res_sample = controlnet(
-                            torch.cat([latents] * 2),
-                            torch.cat([timesteps] * 2),
-                            encoder_hidden_states=torch.cat([prompt_embeds] * 2),
-                            added_cond_kwargs=unet_added_conditions,
-                            controlnet_cond=torch.cat([controlnet_image] * 2),
-                            return_dict=False,
-                        )
-                        noise_pred = unet(
-                            torch.cat([latents] * 2),
-                            torch.cat([timesteps] * 2),
-                            encoder_hidden_states=torch.cat([prompt_embeds] * 2),
-                            added_cond_kwargs=unet_added_conditions,
-                            down_block_additional_residuals=[
-                                sample.to(dtype=args.mixed_precision) for sample in down_block_res_samples
-                            ],
-                            mid_block_additional_residual=mid_block_res_sample.to(dtype=args.mixed_precision),
-                            return_dict=False
-                        )[0]
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
-                            noise_pred_text - noise_pred_uncond
-                        )
-
-                        # TODO: Change
-                        scheduler_step_output = scheduler_step(
-                            noise_pred,
-                            timesteps,
-                            latents,
-                            eta=self.config.sample_eta,
-                            variance_noise=next_latents,
-                        )
-
-                        log_prob = scheduler_step_output.log_probs
-
-                    advantages = torch.clamp(
-                        advantages,
-                        -self.config.train_adv_clip_max,
-                        self.config.train_adv_clip_max,
-                    )
-
-                    ratio = torch.exp(log_prob - log_probs)
-
-                    loss = loss_(advantages, self.config.train_clip_range, ratio)
-
-                    approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
-
-                    clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
-
-
-                    info["approx_kl"].append(approx_kl)
-                    info["clipfrac"].append(clipfrac)
-                    info["loss"].append(loss)
-
-                    accelerator.backward(loss)
-                    # changed this ----- trainable_layers (deleted)
-                    if accelerator.sync_gradients:
-                        params_to_clip = controlnet.parameters()
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-
-                # Checks if the accelerator has performed an optimization step behind the scenes
-                ################# TODO: need to check here
-                if accelerator.sync_gradients:
-                    # log training-related stuff
-                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                    info = accelerator.reduce(info, reduction="mean")
-                    info.update({"epoch": epoch})
-                    accelerator.log(info, step=global_step)
-                    global_step += 1
-                    info = defaultdict(list)
-
             #####TODO: we calculate loss
+            controlnet.train()
+            info = defaultdict(list)
 
-###########Newly added codes end here###########
+            for _i, sample in tqdm(enumerate(samples_batched)):
+                print('!!!!!!!!!!!!!!!!!!!!',_i)
+                for j in range(num_train_timesteps):
+                    print('jjjjjj',j)
+                    with accelerator.accumulate(controlnet):
+                        latents = sample["latents"][:, j] 
+                        timesteps = sample["timesteps"][:, j]
+                        next_latents = sample["next_latents"][:, j]
+                        log_probs = sample["log_probs"][:, j]
+                        advantages = sample["advantages"]
+                        conditioning_pixel_values = sample["conditioning_pixel_values"]
+                        encoder_hidden_states = sample["encoder_hidden_states"]
+                        text_embeds = sample["text_embeds"]
+                        time_ids = sample["time_ids"]
 
-        # Checks if the accelerator has performed an optimization step behind the scenes
-                # if accelerator.sync_gradients:
-                    progress_bar.update(1)
-                    # global_step += 1
-
-                    # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
-                    if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
-                        if global_step % args.checkpointing_steps == 0:
-                            # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                            if args.checkpoints_total_limit is not None:
-                                checkpoints = os.listdir(args.output_dir)
-                                checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                                checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                                # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                                if len(checkpoints) >= args.checkpoints_total_limit:
-                                    num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                    removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                    logger.info(
-                                        f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                    )
-                                    logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                    for removing_checkpoint in removing_checkpoints:
-                                        removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                        shutil.rmtree(removing_checkpoint)
-
-                            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                            accelerator.save_state(save_path)
-                            logger.info(f"Saved state to {save_path}")
-
-                        if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                            image_logs = log_validation(
-                                vae=vae,
-                                unet=unet,
-                                controlnet=controlnet,
-                                args=args,
-                                accelerator=accelerator,
-                                weight_dtype=weight_dtype,
-                                step=global_step,
+                        with accelerator.autocast():
+                            controlnet_image = conditioning_pixel_values.to(dtype=args.mixed_precision)
+                            unet_added_conditions = {"text_embeds" : text_embeds, "time_ids" : time_ids}
+                            down_block_res_samples, mid_block_res_sample = controlnet(
+                                latents, #매번 오는 거
+                                timesteps, #매번 오는 거
+                                encoder_hidden_states=encoder_hidden_states, #
+                                controlnet_cond=torch.cat([controlnet_image] * 2),
+                                conditioning_scale=cond_scale,
+                                guess_mode=False,
+                                added_cond_kwargs=unet_added_conditions,
+                                return_dict=False,
                             )
 
-                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=global_step)
+                            noise_pred = unet(
+                                latents,
+                                timesteps,
+                                encoder_hidden_states=encoder_hidden_states,
+                                timestep_cond=None,
+                                cross_attention_kwargs=None,
+                                added_cond_kwargs=added_cond_kwargs,
+                                down_block_additional_residuals=down_block_res_samples,
+                                mid_block_additional_residual=mid_block_res_sample,
+                                return_dict=False,
+                            )[0]
 
-                if global_step >= args.max_train_steps:
-                    break
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-    # Create the pipeline using using the trained modules and save it.
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        controlnet = unwrap_model(controlnet)
-        controlnet.save_pretrained(args.output_dir)
+                            # TODO: Change
+                            _, log_prob = scheduler_step(noise_scheduler, noise_pred, timesteps, latents, **extra_step_kwargs, variance_noise=next_latents)
 
-        # Run a final round of validation.
-        # Setting `vae`, `unet`, and `controlnet` to None to load automatically from `args.output_dir`.
-        image_logs = None
-        if args.validation_prompt is not None:
-            image_logs = log_validation(
-                vae=None,
-                unet=None,
-                controlnet=None,
-                args=args,
-                accelerator=accelerator,
-                weight_dtype=weight_dtype,
-                step=global_step,
-                is_final_validation=True,
-            )
+                        advantages = torch.clamp(
+                            advantages,
+                            -args.config.train_adv_clip_max,
+                            args.config.train_adv_clip_max,
+                        )
 
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                image_logs=image_logs,
-                base_model=args.pretrained_model_name_or_path,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
+                        ratio = torch.exp(log_prob - log_probs)
 
-    accelerator.end_training()
+                        loss = loss_(advantages, args.train_clip_range, ratio)
+
+                        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
+
+                        clipfrac = torch.mean((torch.abs(ratio - 1.0) > args.train_clip_range).float())
+
+
+                        info["approx_kl"].append(approx_kl)
+                        info["clipfrac"].append(clipfrac)
+                        info["loss"].append(loss)
+
+                        accelerator.backward(loss)
+                        # changed this ----- trainable_layers (deleted)
+                        if accelerator.sync_gradients:
+                            params_to_clip = controlnet.parameters()
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+
+                    # Checks if the accelerator has performed an optimization step behind the scenes
+                    ################# TODO: need to check here
+                    if accelerator.sync_gradients:
+                        # log training-related stuff
+                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                        info = accelerator.reduce(info, reduction="mean")
+                        info.update({"epoch": epoch})
+                        accelerator.log(info, step=global_step)
+                        global_step += 1
+                        info = defaultdict(list)
+
+                #####TODO: we calculate loss
+
+    ###########Newly added codes end here###########
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                # global_step += 1
+
+                # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
+                if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
+                    if step % args.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+
+                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                        image_logs = log_validation(
+                            vae=vae,
+                            unet=unet,
+                            controlnet=controlnet,
+                            args=args,
+                            accelerator=accelerator,
+                            weight_dtype=weight_dtype,
+                            step=global_step,
+                        )
+
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
+
+        # Create the pipeline using using the trained modules and save it.
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            controlnet = unwrap_model(controlnet)
+            controlnet.save_pretrained(args.output_dir)
+
+            # Run a final round of validation.
+            # Setting `vae`, `unet`, and `controlnet` to None to load automatically from `args.output_dir`.
+            image_logs = None
+            if args.validation_prompt is not None:
+                image_logs = log_validation(
+                    vae=None,
+                    unet=None,
+                    controlnet=None,
+                    args=args,
+                    accelerator=accelerator,
+                    weight_dtype=weight_dtype,
+                    step=global_step,
+                    is_final_validation=True,
+                )
+
+            if args.push_to_hub:
+                save_model_card(
+                    repo_id,
+                    image_logs=image_logs,
+                    base_model=args.pretrained_model_name_or_path,
+                    repo_folder=args.output_dir,
+                )
+                upload_folder(
+                    repo_id=repo_id,
+                    folder_path=args.output_dir,
+                    commit_message="End of training",
+                    ignore_patterns=["step_*", "epoch_*"],
+                )
+
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
