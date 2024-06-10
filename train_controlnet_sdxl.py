@@ -382,7 +382,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=1,
+        default=10,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -689,15 +689,15 @@ def get_train_dataset(args, accelerator):
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        logger.info(f"image column defaulting to {image_column}")
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
+    # if args.image_column is None:
+    #     image_column = column_names[0]
+    #     logger.info(f"image column defaulting to {image_column}")
+    # else:
+    #     image_column = args.image_column
+    #     if image_column not in column_names:
+    #         raise ValueError(
+    #             f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+    #         )
 
     if args.caption_column is None:
         caption_column = column_names[1]
@@ -795,13 +795,13 @@ def prepare_train_dataset(dataset, accelerator):
     )
 
     def preprocess_train(examples):
-        images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
-        images = [image_transforms(image) for image in images]
+        # images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
+        # images = [image_transforms(image) for image in images]
 
         conditioning_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
 
-        examples["pixel_values"] = images
+        # examples["pixel_values"] = images
         examples["conditioning_pixel_values"] = conditioning_images
 
         return examples
@@ -812,8 +812,8 @@ def prepare_train_dataset(dataset, accelerator):
     return dataset
 
 def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    # pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -831,7 +831,7 @@ def collate_fn(examples):
         
     return {
         "prompts": prompts,
-        "pixel_values": pixel_values,
+        # "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
         "neg_prompt_ids": neg_prompt_ids,
@@ -1228,7 +1228,7 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir, automatic_checkpoint_naming=True)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     num_train_timesteps = int(args.num_train_inference_steps * 1.0) #(config.sample_num_steps ,config.train_timestep_fraction)
     accelerator = Accelerator(
@@ -1975,7 +1975,7 @@ def main(args):
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
+                            if len(checkpoints) >= args.checkpoints_total_limit and accelerator.is_main_process:
                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
 

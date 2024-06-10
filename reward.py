@@ -67,7 +67,7 @@ class RewardComputation():
     def reward_fn(self, images, prompts, metadata):
         alignment_scores = self.alignment_scorer(images, prompts)
         pose_scores = self.pose_scorer(images, prompts)
-        scores = alignment_scores + pose_scores
+        scores = alignment_scores/2 + pose_scores #temporary expedient
         return scores, {}
 
     def compute_rewards(self, prompt_image_pairs):
