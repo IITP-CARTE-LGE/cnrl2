@@ -72,7 +72,7 @@ class RewardComputation():
 
     def compute_rewards(self, prompt_image_pairs):
         rewards = []
-        for images, prompts, prompt_metadata in tqdm(prompt_image_pairs):
+        for images, prompts, prompt_metadata in prompt_image_pairs:
             reward, reward_metadata = self.reward_fn(images, prompts, prompt_metadata)
             rewards.append(
                 (
