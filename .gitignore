@@ -5,3 +5,5 @@ train_example.py
 train_example.sh
 *.lock
 ac_config.yaml
+wandb/
+__pycache__/

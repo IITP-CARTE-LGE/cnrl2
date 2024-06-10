@@ -22,6 +22,7 @@ import math
 import os
 import random
 import shutil
+from typing import Optional
 from contextlib import nullcontext
 from pathlib import Path
 import copy
@@ -369,7 +370,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=10,
         help=(
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -381,7 +382,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=1,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -764,7 +765,7 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     
-    ### consumed negative prompts to be zero_out=True
+    ### assumed negative prompts to be zero_out=True
     negative_prompt_embeds = torch.zeros_like(prompt_embeds)
     negative_pooled_prompt_embeds = torch.zeros_like(pooled_prompt_embeds)
     # negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
@@ -915,6 +916,140 @@ def upcast_vae(vae):
         vae.decoder.conv_in.to(dtype)
         vae.decoder.mid_block.to(dtype)
         
+# def scheduler_step(
+#     self,
+#     model_output: torch.FloatTensor,
+#     timestep: int,
+#     sample: torch.FloatTensor,
+#     eta: float = 0.0,
+#     use_clipped_model_output: bool = False,
+#     generator = None,
+#     variance_noise = None,
+#     return_dict: bool = True,
+# ):
+#     """
+#     Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
+#     process from the learned model outputs (most often the predicted noise).
+
+#     Args:
+#         model_output (`torch.FloatTensor`):
+#             The direct output from learned diffusion model.
+#         timestep (`float`):
+#             The current discrete timestep in the diffusion chain.
+#         sample (`torch.FloatTensor`):
+#             A current instance of a sample created by the diffusion process.
+#         eta (`float`):
+#             The weight of noise for added noise in diffusion step.
+#         use_clipped_model_output (`bool`, defaults to `False`):
+#             If `True`, computes "corrected" `model_output` from the clipped predicted original sample. Necessary
+#             because predicted original sample is clipped to [-1, 1] when `self.config.clip_sample` is `True`. If no
+#             clipping has happened, "corrected" `model_output` would coincide with the one provided as input and
+#             `use_clipped_model_output` has no effect.
+#         generator (`torch.Generator`, *optional*):
+#             A random number generator.
+#         variance_noise (`torch.FloatTensor`):
+#             Alternative to generating noise with `generator` by directly providing the noise for the variance
+#             itself. Useful for methods such as [`CycleDiffusion`].
+#         return_dict (`bool`, *optional*, defaults to `True`):
+#             Whether or not to return a [`~schedulers.scheduling_ddim.DDIMSchedulerOutput`] or `tuple`.
+
+#     Returns:
+#         [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] or `tuple`:
+#             If return_dict is `True`, [`~schedulers.scheduling_ddim.DDIMSchedulerOutput`] is returned, otherwise a
+#             tuple is returned where the first element is the sample tensor.
+
+#     """
+#     if self.num_inference_steps is None:
+#         raise ValueError(
+#             "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+#         )
+
+#     # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
+#     # Ideally, read DDIM paper in-detail understanding
+
+#     # Notation (<variable name> -> <name in paper>
+#     # - pred_noise_t -> e_theta(x_t, t)
+#     # - pred_original_sample -> f_theta(x_t, t) or x_0
+#     # - std_dev_t -> sigma_t
+#     # - eta -> η
+#     # - pred_sample_direction -> "direction pointing to x_t"
+#     # - pred_prev_sample -> "x_t-1"
+
+#     # 1. get previous step value (=t-1)
+#     prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+
+#     # 2. compute alphas, betas
+#     self.alphas_cumprod = self.alphas_cumprod.to(model_output.device)
+#     alpha_prod_t = self.alphas_cumprod[timestep]
+#     alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+
+#     beta_prod_t = 1 - alpha_prod_t
+
+#     # 3. compute predicted original sample from predicted noise also called
+#     # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+#     if self.config.prediction_type == "epsilon":
+#         pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+#         pred_epsilon = model_output
+#     elif self.config.prediction_type == "sample":
+#         pred_original_sample = model_output
+#         pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+#     elif self.config.prediction_type == "v_prediction":
+#         pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+#         pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+#     else:
+#         raise ValueError(
+#             f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
+#             " `v_prediction`"
+#         )
+
+#     # 4. Clip or threshold "predicted x_0"
+#     if self.config.thresholding:
+#         pred_original_sample = self._threshold_sample(pred_original_sample)
+#     elif self.config.clip_sample:
+#         pred_original_sample = pred_original_sample.clamp(
+#             -self.config.clip_sample_range, self.config.clip_sample_range
+#         )
+
+#     # 5. compute variance: "sigma_t(η)" -> see formula (16)
+#     # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+#     variance = self._get_variance(timestep, prev_timestep)
+#     std_dev_t = eta * variance ** (0.5)
+
+#     if use_clipped_model_output:
+#         # the pred_epsilon is always re-derived from the clipped x_0 in Glide
+#         pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+
+#     # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+#     pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * pred_epsilon
+
+#     # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+#     prev_sample_mean = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+
+#     if variance_noise is not None and generator is not None:
+#         raise ValueError(
+#             "Cannot pass both generator and variance_noise. Please make sure that either `generator` or"
+#             " `variance_noise` stays `None`."
+#         )
+
+#     if variance_noise is None:
+#         variance_noise = randn_tensor(
+#             model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype
+#         )
+#     variance = std_dev_t * variance_noise
+
+#     prev_sample = prev_sample_mean + variance
+        
+#     # log prob of prev_sample given prev_sample_mean and std_dev_t
+#     log_prob = (
+#         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
+#         - torch.log(std_dev_t)
+#         - torch.log(torch.sqrt(2 * torch.as_tensor(np.pi)))
+#     )
+#     # mean along all but batch dimension
+#     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+
+#     return prev_sample, log_prob
+
 def scheduler_step(
     self,
     model_output: torch.FloatTensor,
@@ -922,42 +1057,33 @@ def scheduler_step(
     sample: torch.FloatTensor,
     eta: float = 0.0,
     use_clipped_model_output: bool = False,
-    generator = None,
-    variance_noise = None,
-    return_dict: bool = True,
-):
+    generator=None,
+    prev_sample: Optional[torch.FloatTensor] = None,
+    ):
     """
-    Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
+
+    Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
     process from the learned model outputs (most often the predicted noise).
 
     Args:
-        model_output (`torch.FloatTensor`):
-            The direct output from learned diffusion model.
-        timestep (`float`):
-            The current discrete timestep in the diffusion chain.
+        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
+        timestep (`int`): current discrete timestep in the diffusion chain.
         sample (`torch.FloatTensor`):
-            A current instance of a sample created by the diffusion process.
-        eta (`float`):
-            The weight of noise for added noise in diffusion step.
-        use_clipped_model_output (`bool`, defaults to `False`):
-            If `True`, computes "corrected" `model_output` from the clipped predicted original sample. Necessary
-            because predicted original sample is clipped to [-1, 1] when `self.config.clip_sample` is `True`. If no
-            clipping has happened, "corrected" `model_output` would coincide with the one provided as input and
-            `use_clipped_model_output` has no effect.
-        generator (`torch.Generator`, *optional*):
-            A random number generator.
-        variance_noise (`torch.FloatTensor`):
-            Alternative to generating noise with `generator` by directly providing the noise for the variance
-            itself. Useful for methods such as [`CycleDiffusion`].
-        return_dict (`bool`, *optional*, defaults to `True`):
-            Whether or not to return a [`~schedulers.scheduling_ddim.DDIMSchedulerOutput`] or `tuple`.
+            current instance of sample being created by diffusion process.
+        eta (`float`): weight of noise for added noise in diffusion step.
+        use_clipped_model_output (`bool`): if `True`, compute "corrected" `model_output` from the clipped
+            predicted original sample. Necessary because predicted original sample is clipped to [-1, 1] when
+            `self.config.clip_sample` is `True`. If no clipping has happened, "corrected" `model_output` would
+            coincide with the one provided as input and `use_clipped_model_output` will have not effect.
+        generator: random number generator.
+        variance_noise (`torch.FloatTensor`): instead of generating noise for the variance using `generator`, we
+            can directly provide the noise for the variance itself. This is useful for methods such as
+            CycleDiffusion. (https://arxiv.org/abs/2210.05559)
 
     Returns:
-        [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] or `tuple`:
-            If return_dict is `True`, [`~schedulers.scheduling_ddim.DDIMSchedulerOutput`] is returned, otherwise a
-            tuple is returned where the first element is the sample tensor.
-
+        `DDPOSchedulerOutput`: the predicted sample at the previous timestep and the log probability of the sample
     """
+
     if self.num_inference_steps is None:
         raise ValueError(
             "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
@@ -976,11 +1102,18 @@ def scheduler_step(
 
     # 1. get previous step value (=t-1)
     prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+    # to prevent OOB on gather
+    prev_timestep = torch.clamp(prev_timestep, 0, self.config.num_train_timesteps - 1)
 
     # 2. compute alphas, betas
-    # self.alphas_cumprod = self.alphas_cumprod.to('cuda')
-    alpha_prod_t = self.alphas_cumprod[timestep]
-    alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+    alpha_prod_t = self.alphas_cumprod.gather(0, timestep.cpu())
+    alpha_prod_t_prev = torch.where(
+        prev_timestep.cpu() >= 0,
+        self.alphas_cumprod.gather(0, prev_timestep.cpu()),
+        self.final_alpha_cumprod,
+    )
+    alpha_prod_t = _left_broadcast(alpha_prod_t, sample.shape).to(sample.device)
+    alpha_prod_t_prev = _left_broadcast(alpha_prod_t_prev, sample.shape).to(sample.device)
 
     beta_prod_t = 1 - alpha_prod_t
 
@@ -1011,8 +1144,9 @@ def scheduler_step(
 
     # 5. compute variance: "sigma_t(η)" -> see formula (16)
     # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-    variance = self._get_variance(timestep, prev_timestep)
+    variance = _get_variance(self, timestep, prev_timestep)
     std_dev_t = eta * variance ** (0.5)
+    std_dev_t = _left_broadcast(std_dev_t, sample.shape).to(sample.device)
 
     if use_clipped_model_output:
         # the pred_epsilon is always re-derived from the clipped x_0 in Glide
@@ -1024,20 +1158,21 @@ def scheduler_step(
     # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
     prev_sample_mean = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
 
-    if variance_noise is not None and generator is not None:
+    if prev_sample is not None and generator is not None:
         raise ValueError(
-            "Cannot pass both generator and variance_noise. Please make sure that either `generator` or"
-            " `variance_noise` stays `None`."
+            "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
+            " `prev_sample` stays `None`."
         )
 
-    if variance_noise is None:
+    if prev_sample is None:
         variance_noise = randn_tensor(
-            model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype
+            model_output.shape,
+            generator=generator,
+            device=model_output.device,
+            dtype=model_output.dtype,
         )
-    variance = std_dev_t * variance_noise
+        prev_sample = prev_sample_mean + std_dev_t * variance_noise
 
-    prev_sample = prev_sample_mean + variance
-        
     # log prob of prev_sample given prev_sample_mean and std_dev_t
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
@@ -1047,8 +1182,36 @@ def scheduler_step(
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
-    return prev_sample, log_prob
+    return prev_sample.type(sample.dtype), log_prob
 
+def _left_broadcast(input_tensor, shape):
+    """
+    As opposed to the default direction of broadcasting (right to left), this function broadcasts
+    from left to right
+        Args:
+            input_tensor (`torch.FloatTensor`): is the tensor to broadcast
+            shape (`Tuple[int]`): is the shape to broadcast to
+    """
+    input_ndim = input_tensor.ndim
+    if input_ndim > len(shape):
+        raise ValueError(
+            "The number of dimensions of the tensor to broadcast cannot be greater than the length of the shape to broadcast to"
+        )
+    return input_tensor.reshape(input_tensor.shape + (1,) * (len(shape) - input_ndim)).broadcast_to(shape)
+
+def _get_variance(self, timestep, prev_timestep):
+    alpha_prod_t = torch.gather(self.alphas_cumprod, 0, timestep.cpu()).to(timestep.device)
+    alpha_prod_t_prev = torch.where(
+        prev_timestep.cpu() >= 0,
+        self.alphas_cumprod.gather(0, prev_timestep.cpu()),
+        self.final_alpha_cumprod,
+    ).to(timestep.device)
+    beta_prod_t = 1 - alpha_prod_t
+    beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+    variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+
+    return variance
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1065,7 +1228,7 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir, automatic_checkpoint_naming=True)
 
     num_train_timesteps = int(args.num_train_inference_steps * 1.0) #(config.sample_num_steps ,config.train_timestep_fraction)
     accelerator = Accelerator(
@@ -1448,20 +1611,23 @@ def main(args):
     else:
         initial_global_step = 0
 
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
+    progress_bar_epoch = tqdm(
+        range(0, args.num_train_epochs),
         initial=initial_global_step,
-        desc="Steps",
+        desc="epochs",
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
+    progress_bar_step = tqdm(
+        range(0, args.max_train_steps * num_train_timesteps),
+        initial=initial_global_step,
+        desc="global_step",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            ###Checking!
-            print(f"STEPEPEPEPEPEPEPEPEP:{step}")
-            
             #####TODO[Done]: we generate images, latents, log_probs
             samples = []
             prompt_image_pairs = []
@@ -1502,11 +1668,11 @@ def main(args):
                 is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
                 
                 ### preparing encoder_hidden_states, controlnet_cond, added_cond_kwargs from dataloader
-                encoder_hidden_states = torch.cat([batch["neg_prompt_ids"], batch["prompt_ids"]], dim=0)
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                add_text_embeds = torch.cat([batch['neg_unet_added_conditions']['text_embeds'], batch['unet_added_conditions']['text_embeds']], dim=0)
-                add_time_ids = torch.cat([batch['neg_unet_added_conditions']['time_ids'], batch['unet_added_conditions']['time_ids']], dim=0)
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                inf_encoder_hidden_states = torch.cat([batch["neg_prompt_ids"], batch["prompt_ids"]], dim=0)
+                inf_controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                inf_add_text_embeds = torch.cat([batch['neg_unet_added_conditions']['text_embeds'], batch['unet_added_conditions']['text_embeds']], dim=0)
+                inf_add_time_ids = torch.cat([batch['neg_unet_added_conditions']['time_ids'], batch['unet_added_conditions']['time_ids']], dim=0)
+                inf_added_cond_kwargs = {"text_embeds": inf_add_text_embeds, "time_ids": inf_add_time_ids}
                 
                 ###generation
                 # (1) saving all latents & log_probs is needed
@@ -1523,27 +1689,29 @@ def main(args):
                     if isinstance(controlnet_cond_scale, list):
                         controlnet_cond_scale = controlnet_cond_scale[0]
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
-                        
+
                     # ControlNet conditioning.
                     down_block_res_samples, mid_block_res_sample = controlnet(
                         control_model_input, #매번 오는 거
                         t, #매번 오는 거
-                        encoder_hidden_states=encoder_hidden_states, #
-                        controlnet_cond=torch.cat([controlnet_image] * 2),
+                        encoder_hidden_states=inf_encoder_hidden_states, #
+                        controlnet_cond=torch.cat([inf_controlnet_image] * 2),
                         conditioning_scale=cond_scale,
                         guess_mode=False,
-                        added_cond_kwargs=added_cond_kwargs,
+                        added_cond_kwargs=inf_added_cond_kwargs,
                         return_dict=False,
                     )
 
                     noise_pred = unet(
                         latent_model_input,
                         t,
-                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_hidden_states=inf_encoder_hidden_states,
                         timestep_cond=None,
                         cross_attention_kwargs=None,
-                        added_cond_kwargs=added_cond_kwargs,
-                        down_block_additional_residuals=down_block_res_samples,
+                        added_cond_kwargs=inf_added_cond_kwargs,
+                        down_block_additional_residuals=[
+                            d_sample.to(dtype=weight_dtype) for d_sample in down_block_res_samples
+                        ],
                         mid_block_additional_residual=mid_block_res_sample,
                         return_dict=False,
                     )[0]
@@ -1585,8 +1753,6 @@ def main(args):
                     vae.to(dtype=torch.float16)
                     
                 images = image_processor.postprocess(image, output_type='pil')
-                # images[0].save(f'./step_{step}_0.png')
-                # images[1].save(f'./step_{step}_1.png')
                 #####TODO[Done]: we generate images, latents, log_probs
 
 
@@ -1601,13 +1767,17 @@ def main(args):
                     "latents": latents[:, :-1],
                     "next_latents": latents[:, 1:],
                     "timesteps": timesteps,
-                    "encoder_hidden_states": encoder_hidden_states, 
-                    "conditioning_pixel_values": controlnet_image,
-                    "text_embeds": add_text_embeds,
-                    "time_ids": add_time_ids,
+                    "conditioning_pixel_values": batch["conditioning_pixel_values"],
+                    "prompt_ids": batch["prompt_ids"], 
+                    "text_embeds": batch['unet_added_conditions']["text_embeds"],
+                    "time_ids": batch['unet_added_conditions']["time_ids"],
+                    "neg_prompt_ids": batch["neg_prompt_ids"], 
+                    "neg_text_embeds": batch['neg_unet_added_conditions']["text_embeds"],
+                    "neg_time_ids": batch['neg_unet_added_conditions']["time_ids"],
                     "log_probs": log_probs,
                 }
             )
+
             prompt_image_pairs.append([images, batch["prompts"], {}])
             torch.cuda.empty_cache()
 
@@ -1659,6 +1829,7 @@ def main(args):
             ##########TODO HERE TO BE MODIFIED : for loop removed from here
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size_, device=accelerator.device)
+
             _samples = {}
             for k, v in samples.items():
                 v = v.to(accelerator.device)
@@ -1668,12 +1839,12 @@ def main(args):
             # shuffle along time dimension independently for each sample
             # still trying to understand the code below
             perms = torch.stack(
-                [torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)]
+                [torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size_)]
             )
 
             for key in ["timesteps", "latents", "next_latents", "log_probs"]:
                 samples[key] = samples[key][
-                    torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                    torch.arange(total_batch_size_, device=accelerator.device)[:, None],
                     perms,
                 ]
 
@@ -1692,43 +1863,51 @@ def main(args):
             controlnet.train()
             info = defaultdict(list)
 
-            for _i, sample in tqdm(enumerate(samples_batched)):
-                print('!!!!!!!!!!!!!!!!!!!!',_i)
+            for _i, sample in enumerate(samples_batched):
                 for j in range(num_train_timesteps):
-                    print('jjjjjj',j)
                     with accelerator.accumulate(controlnet):
                         latents = sample["latents"][:, j] 
                         timesteps = sample["timesteps"][:, j]
                         next_latents = sample["next_latents"][:, j]
                         log_probs = sample["log_probs"][:, j]
                         advantages = sample["advantages"]
-                        conditioning_pixel_values = sample["conditioning_pixel_values"]
-                        encoder_hidden_states = sample["encoder_hidden_states"]
+                        conditioning_pixel_values = sample["conditioning_pixel_values"].to(dtype=weight_dtype)
+                        prompt_ids = sample["prompt_ids"]
                         text_embeds = sample["text_embeds"]
                         time_ids = sample["time_ids"]
+                        neg_prompt_ids = sample["neg_prompt_ids"]
+                        neg_text_embeds = sample["neg_text_embeds"]
+                        neg_time_ids = sample["neg_time_ids"]
+
+                        encoder_hidden_states = torch.cat([neg_prompt_ids, prompt_ids], dim=0)
+                        add_text_embeds = torch.cat([neg_text_embeds, text_embeds], dim=0)
+                        add_time_ids = torch.cat([neg_time_ids, time_ids], dim=0)
+
 
                         with accelerator.autocast():
-                            controlnet_image = conditioning_pixel_values.to(dtype=args.mixed_precision)
-                            unet_added_conditions = {"text_embeds" : text_embeds, "time_ids" : time_ids}
+                            controlnet_image = conditioning_pixel_values
+                            added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                             down_block_res_samples, mid_block_res_sample = controlnet(
-                                latents, #매번 오는 거
-                                timesteps, #매번 오는 거
+                                torch.cat([latents] * 2), #매번 오는 거
+                                torch.cat([timesteps] * 2), #매번 오는 거
                                 encoder_hidden_states=encoder_hidden_states, #
                                 controlnet_cond=torch.cat([controlnet_image] * 2),
                                 conditioning_scale=cond_scale,
                                 guess_mode=False,
-                                added_cond_kwargs=unet_added_conditions,
+                                added_cond_kwargs=added_cond_kwargs,
                                 return_dict=False,
                             )
 
                             noise_pred = unet(
-                                latents,
-                                timesteps,
+                                torch.cat([latents] * 2),
+                                torch.cat([timesteps] * 2),
                                 encoder_hidden_states=encoder_hidden_states,
                                 timestep_cond=None,
                                 cross_attention_kwargs=None,
                                 added_cond_kwargs=added_cond_kwargs,
-                                down_block_additional_residuals=down_block_res_samples,
+                                down_block_additional_residuals=[
+                                    sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                                ],
                                 mid_block_additional_residual=mid_block_res_sample,
                                 return_dict=False,
                             )[0]
@@ -1737,18 +1916,16 @@ def main(args):
                             noise_pred = noise_pred_uncond + args.train_inference_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                             # TODO: Change
-                            _, log_prob = scheduler_step(noise_scheduler, noise_pred, timesteps, latents, **extra_step_kwargs, variance_noise=next_latents)
-
+                            _, log_prob = scheduler_step(noise_scheduler, noise_pred, timesteps, latents, **extra_step_kwargs, prev_sample=next_latents)
                         advantages = torch.clamp(
                             advantages,
-                            -args.config.train_adv_clip_max,
-                            args.config.train_adv_clip_max,
+                            -args.train_adv_clip_max,
+                            args.train_adv_clip_max,
                         )
 
                         ratio = torch.exp(log_prob - log_probs)
 
                         loss = loss_(advantages, args.train_clip_range, ratio)
-
                         approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
 
                         clipfrac = torch.mean((torch.abs(ratio - 1.0) > args.train_clip_range).float())
@@ -1776,6 +1953,7 @@ def main(args):
                         info = accelerator.reduce(info, reduction="mean")
                         info.update({"epoch": epoch})
                         accelerator.log(info, step=global_step)
+                        progress_bar_step.update(1)
                         global_step += 1
                         info = defaultdict(list)
 
@@ -1785,12 +1963,11 @@ def main(args):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                progress_bar.update(1)
                 # global_step += 1
 
                 # DeepSpeed requires saving weights on every device; saving weights only on the main process would cause issues.
                 if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.is_main_process:
-                    if step % args.checkpointing_steps == 0:
+                    if step != 0 and step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
@@ -1826,49 +2003,48 @@ def main(args):
                             step=global_step,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            # progress_bar.set_postfix(**logs)
 
-            if global_step >= args.max_train_steps:
-                break
-
+            # if global_step >= args.max_train_steps:
+            #     break
+        if accelerator.sync_gradients:
+            progress_bar_epoch.update(1)
         # Create the pipeline using using the trained modules and save it.
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            controlnet = unwrap_model(controlnet)
-            controlnet.save_pretrained(args.output_dir)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        controlnet = unwrap_model(controlnet)
+        controlnet.save_pretrained(args.output_dir)
 
-            # Run a final round of validation.
-            # Setting `vae`, `unet`, and `controlnet` to None to load automatically from `args.output_dir`.
-            image_logs = None
-            if args.validation_prompt is not None:
-                image_logs = log_validation(
-                    vae=None,
-                    unet=None,
-                    controlnet=None,
-                    args=args,
-                    accelerator=accelerator,
-                    weight_dtype=weight_dtype,
-                    step=global_step,
-                    is_final_validation=True,
-                )
+        # Run a final round of validation.
+        # Setting `vae`, `unet`, and `controlnet` to None to load automatically from `args.output_dir`.
+        image_logs = None
+        if args.validation_prompt is not None:
+            image_logs = log_validation(
+                vae=None,
+                unet=None,
+                controlnet=None,
+                args=args,
+                accelerator=accelerator,
+                weight_dtype=weight_dtype,
+                step=global_step,
+                is_final_validation=True,
+            )
 
-            if args.push_to_hub:
-                save_model_card(
-                    repo_id,
-                    image_logs=image_logs,
-                    base_model=args.pretrained_model_name_or_path,
-                    repo_folder=args.output_dir,
-                )
-                upload_folder(
-                    repo_id=repo_id,
-                    folder_path=args.output_dir,
-                    commit_message="End of training",
-                    ignore_patterns=["step_*", "epoch_*"],
-                )
+        if args.push_to_hub:
+            save_model_card(
+                repo_id,
+                image_logs=image_logs,
+                base_model=args.pretrained_model_name_or_path,
+                repo_folder=args.output_dir,
+            )
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
 
-        accelerator.end_training()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
