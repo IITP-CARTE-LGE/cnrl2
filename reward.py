@@ -81,4 +81,24 @@ class RewardComputation():
                 )
             )
         return zip(*rewards)
-        
+
+if __name__=="__main__":
+    from PIL import Image
+    import torch.nn as nn
+    image_list = ['/scratch/heywon/data/openpose/0a0d2e231f162f2d.png','/scratch/heywon/data/openpose/0a4a0b2f2b2f1b0b.png','/scratch/heywon/data/openpose/0a4b0f27232f1f2b.png']
+    images = []
+    for image in image_list:
+        images.append(Image.open(image))
+    pose_scorer = PoseScorer('cuda')
+    ch = pose_scorer.openpose(images[0])
+    print(ch)
+
+    feature1 = pose_scorer.feature_extraction(images[0])
+    feature2 = pose_scorer.feature_extraction(images[1])
+    feature3 = pose_scorer.feature_extraction(images[2])
+
+    cos = nn.CosineSimilarity(dim=1)
+    sim1 = cos(feature1, feature2)
+    sim2 = cos(feature2, feature3)
+    sim3 = cos(feature1, feature3)
+    print(sim1,sim2,sim3)
