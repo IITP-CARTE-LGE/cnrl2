@@ -680,7 +680,7 @@ def get_train_dataset(args, accelerator):
             #     args.train_data_dir,
             #     cache_dir=args.cache_dir,
             # )
-            dataset = load_dataset("json", data_files=args.train_data_dir, cache_dir="./")
+            dataset = load_dataset("json", data_files=args.train_data_dir, cache_dir=args.cache_dir)
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
@@ -728,17 +728,21 @@ def get_train_dataset(args, accelerator):
 
 # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
 def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train=True):
-    prompt_embeds_list = []
 
+    import random
+    prompts_example = ['High-resolution','intricate','neutral yet realistic', 'detailed', 'highly detailed','4k','film','8k','Canon','HD','sharp focus','perfect face', 'perfect hands']
+    
+    prompt_embeds_list = []
+    
     captions = []
     for caption in prompt_batch:
-        if random.random() < proportion_empty_prompts:
-            captions.append("")
-        elif isinstance(caption, str):
-            captions.append(caption)
+        if isinstance(caption, str):
+            additional_prompts = ', '.join(random.sample(prompts_example,6))
+            captions.append(f"{caption}, {additional_prompts}, realsitic, hyperrealism")
         elif isinstance(caption, (list, np.ndarray)):
             # take a random caption if there are multiple
             captions.append(random.choice(caption) if is_train else caption[0])
+
     with torch.no_grad():
         for tokenizer, text_encoder in zip(tokenizers, text_encoders):
             text_inputs = tokenizer(
@@ -760,7 +764,6 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
-            
     
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
@@ -780,16 +783,12 @@ def prepare_train_dataset(dataset, accelerator):
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.CenterCrop(args.resolution)
         ]
     )
 
-    conditioning_image_transforms = transforms.Compose(
+    to_tensor_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
         ]
     )
@@ -798,10 +797,12 @@ def prepare_train_dataset(dataset, accelerator):
         # images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
         # images = [image_transforms(image) for image in images]
 
-        conditioning_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+        condition_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
+        condition_images = [image_transforms(image) for image in condition_images]
+        conditioning_images = [to_tensor_transforms(image) for image in condition_images]
 
         # examples["pixel_values"] = images
+        examples["condition_image"] = condition_images
         examples["conditioning_pixel_values"] = conditioning_images
 
         return examples
@@ -815,6 +816,8 @@ def collate_fn(examples):
     # pixel_values = torch.stack([example["pixel_values"] for example in examples])
     # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    condition_image = [example["condition_image"] for example in examples]
+    
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
@@ -831,6 +834,7 @@ def collate_fn(examples):
         
     return {
         "prompts": prompts,
+        "condition_image": condition_image,
         # "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
@@ -1753,6 +1757,9 @@ def main(args):
                     vae.to(dtype=torch.float16)
                     
                 images = image_processor.postprocess(image, output_type='pil')
+
+                images[0].save(f'/share0/heywon/cache/generated/{global_step}_0.png')
+                images[1].save(f'/share0/heywon/cache/generated/{global_step}_1.png')
                 #####TODO[Done]: we generate images, latents, log_probs
 
 
@@ -1778,7 +1785,7 @@ def main(args):
                 }
             )
 
-            prompt_image_pairs.append([images, batch["prompts"], {}])
+            prompt_image_pairs.append([batch["condition_image"], images, batch["prompts"], {}])
             torch.cuda.empty_cache()
 
                     # ### TODO:we need latents, and log_probs
@@ -1790,7 +1797,7 @@ def main(args):
             #####TODO (DONE): we compute rewards
             # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)            
             samples = {k: torch.cat([s[k] for s in samples]) if k != "prompts" else [s[k] for s in samples] for k in samples[0].keys()}
-            rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_pairs)
+            rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_pairs, global_step)
             #####TODO: we compute rewards
             
             #####TODO: turn rewards into advantages
@@ -1960,7 +1967,6 @@ def main(args):
                 #####TODO: we calculate loss
 
     ###########Newly added codes end here###########
-
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 # global_step += 1
@@ -1991,6 +1997,11 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        print('?????????????????????????????????????')
+                        accelerator.wait_for_everyone() 
+                        if accelerator.is_main_process:
+                            controlnet_ = unwrap_model(controlnet)
+                            controlnet_.save_pretrained(save_path)
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                         image_logs = log_validation(

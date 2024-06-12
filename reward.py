@@ -46,16 +46,18 @@ class PoseScorer(torch.nn.Module):
         return image_features
 
     @torch.no_grad()
-    def __call__(self, images, prompts):
+    def __call__(self, original_condition_images, generated_images, prompts, global_step):
         condition_images=[]
-        for image in images:
-            image = self.openpose(image)
+        for i, image in enumerate(generated_images):
+            image = self.openpose(image, detect_resolution=1024, image_resolution=1024)
+            image.save(f'/share0/heywon/cache/generated/{global_step}_generated_{i}.png')
             condition_images.append(image)
+            original_condition_images[i].save(f'/share0/heywon/cache/generated/{global_step}_original_{i}.png')
         
-        image_features = self.feature_extraction(images)
+        original_condition_features = self.feature_extraction(original_condition_images)
         condition_features = self.feature_extraction(condition_images)
         cos = nn.CosineSimilarity(dim=1)
-        sim = cos(image_features, condition_features)
+        sim = cos(original_condition_features, condition_features)
         return sim
 
 class RewardComputation():
@@ -64,16 +66,16 @@ class RewardComputation():
         self.alignment_scorer = AlignmentScorer(self.device)
         self.pose_scorer = PoseScorer(self.device)
 
-    def reward_fn(self, images, prompts, metadata):
+    def reward_fn(self, condition_images, images, prompts, metadata, global_step):
         alignment_scores = self.alignment_scorer(images, prompts)
-        pose_scores = self.pose_scorer(images, prompts)
-        scores = alignment_scores/2 + pose_scores #temporary expedient
+        pose_scores = self.pose_scorer(condition_images, images, prompts, global_step)
+        scores = alignment_scores + pose_scores #temporary expedient
         return scores, {}
 
-    def compute_rewards(self, prompt_image_pairs):
+    def compute_rewards(self, prompt_image_pairs, global_step):
         rewards = []
-        for images, prompts, prompt_metadata in prompt_image_pairs:
-            reward, reward_metadata = self.reward_fn(images, prompts, prompt_metadata)
+        for condition_images, images, prompts, prompt_metadata in prompt_image_pairs:
+            reward, reward_metadata = self.reward_fn(condition_images, images, prompts, prompt_metadata, global_step)
             rewards.append(
                 (
                     torch.as_tensor(reward, device=self.device),
@@ -81,4 +83,24 @@ class RewardComputation():
                 )
             )
         return zip(*rewards)
-        
+
+if __name__=="__main__":
+    from PIL import Image
+    import torch.nn as nn
+    image_list = ['/scratch/heywon/data/openpose/0a0d2e231f162f2d.png','/scratch/heywon/data/openpose/0a4a0b2f2b2f1b0b.png','/scratch/heywon/data/openpose/0a4b0f27232f1f2b.png']
+    images = []
+    for image in image_list:
+        images.append(Image.open(image))
+    pose_scorer = PoseScorer('cuda')
+    ch = pose_scorer.openpose(images[0])
+    print(ch)
+
+    feature1 = pose_scorer.feature_extraction(images[0])
+    feature2 = pose_scorer.feature_extraction(images[1])
+    feature3 = pose_scorer.feature_extraction(images[2])
+
+    cos = nn.CosineSimilarity(dim=1)
+    sim1 = cos(feature1, feature2)
+    sim2 = cos(feature2, feature3)
+    sim3 = cos(feature1, feature3)
+    print(sim1,sim2,sim3)
