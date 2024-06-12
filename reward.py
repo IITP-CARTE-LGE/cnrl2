@@ -50,9 +50,10 @@ class PoseScorer(torch.nn.Module):
         condition_images=[]
         for i, image in enumerate(generated_images):
             image = self.openpose(image, detect_resolution=1024, image_resolution=1024)
-            image.save(f'/share0/heywon/cache/generated/{global_step}_generated_{i}.png')
             condition_images.append(image)
-            original_condition_images[i].save(f'/share0/heywon/cache/generated/{global_step}_original_{i}.png')
+
+        generated_images[0].save(f'/share0/heywon/cache/generated/{global_step}_generated_0.png')
+        original_condition_images[0].save(f'/share0/heywon/cache/generated/{global_step}_original_0.png')
         
         original_condition_features = self.feature_extraction(original_condition_images)
         condition_features = self.feature_extraction(condition_images)

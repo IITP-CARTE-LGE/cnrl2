@@ -1759,7 +1759,6 @@ def main(args):
                 images = image_processor.postprocess(image, output_type='pil')
 
                 images[0].save(f'/share0/heywon/cache/generated/{global_step}_0.png')
-                images[1].save(f'/share0/heywon/cache/generated/{global_step}_1.png')
                 #####TODO[Done]: we generate images, latents, log_probs
 
 
@@ -1997,7 +1996,6 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-                        print('?????????????????????????????????????')
                         accelerator.wait_for_everyone() 
                         if accelerator.is_main_process:
                             controlnet_ = unwrap_model(controlnet)
