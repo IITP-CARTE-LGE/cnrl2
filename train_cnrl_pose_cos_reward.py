@@ -681,10 +681,6 @@ def get_train_dataset(args, accelerator):
         )
     else:
         if args.train_data_dir is not None:
-            # dataset = load_datasset(
-            #     args.train_data_dir,
-            #     cache_dir=args.cache_dir,
-            # )
             dataset = load_dataset("json", data_files=args.train_data_dir, cache_dir=args.cache_dir)
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
@@ -694,15 +690,15 @@ def get_train_dataset(args, accelerator):
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    # if args.image_column is None:
-    #     image_column = column_names[0]
-    #     logger.info(f"image column defaulting to {image_column}")
-    # else:
-    #     image_column = args.image_column
-    #     if image_column not in column_names:
-    #         raise ValueError(
-    #             f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-    #         )
+    if args.image_column is None:
+        image_column = column_names[0]
+        logger.info(f"image column defaulting to {image_column}")
+    else:
+        image_column = args.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
 
     if args.caption_column is None:
         caption_column = column_names[1]
@@ -796,14 +792,14 @@ def prepare_train_dataset(dataset, accelerator):
     )
 
     def preprocess_train(examples):
-        # images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
-        # images = [image_transforms(image) for image in images]
+        images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
+        images = [image_transforms(image) for image in images]
 
         condition_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
         condition_images = [image_transforms(image) for image in condition_images]
         conditioning_images = [to_tensor_transforms(image) for image in condition_images]
 
-        # examples["pixel_values"] = images
+        examples["original_image"] = images
         examples["condition_image"] = condition_images
         examples["conditioning_pixel_values"] = conditioning_images
 
@@ -818,6 +814,7 @@ def collate_fn(examples):
     # pixel_values = torch.stack([example["pixel_values"] for example in examples])
     # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    original_image = [example["original_image"] for example in examples]
     condition_image = [example["condition_image"] for example in examples]
     
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
@@ -836,8 +833,8 @@ def collate_fn(examples):
         
     return {
         "prompts": prompts,
+        "original_image": original_image,
         "condition_image": condition_image,
-        # "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
         "neg_prompt_ids": neg_prompt_ids,
@@ -1784,7 +1781,7 @@ def main(args):
                 }
             )
 
-            prompt_image_pairs.append([batch["condition_image"], images, batch["prompts"], {}])
+            prompt_image_pairs.append([batch["original_image"], batch["condition_image"], images, batch["prompts"], {}])
             torch.cuda.empty_cache()
 
                     # ### TODO:we need latents, and log_probs

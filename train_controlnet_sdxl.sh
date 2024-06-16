@@ -14,6 +14,7 @@ accelerate launch --config_file ./ac_config.yaml --main_process_port 29501 train
  --output_dir=$OUTPUT_DIR \
  --resolution=1024 \
  --train_data_dir='/share0/heywon/jsonl/openImage_final.jsonl' \
+ --cache_dir "/share0/seanlee/" \
  --checkpointing_steps 200 \
  --checkpoints_total_limit 10 \
  --train_batch_size=2 \
