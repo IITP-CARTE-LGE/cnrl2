@@ -1793,7 +1793,7 @@ def main(args):
             #####TODO (DONE): we compute rewards
             # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)            
             samples = {k: torch.cat([s[k] for s in samples]) if k != "prompts" else [s[k] for s in samples] for k in samples[0].keys()}
-            rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_pairs, global_step, args.image_log_dir)
+            rewards, rewards_metadata = reward_computation.compute_rewards2(prompt_image_pairs, global_step, args.image_log_dir)
             #####TODO: we compute rewards
             
             #####TODO: turn rewards into advantages

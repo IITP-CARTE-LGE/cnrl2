@@ -4,6 +4,7 @@ from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration, 
 from bert_score import BERTScorer
 from controlnet_aux import OpenposeDetector
 from tqdm import tqdm
+import numpy as np
 
 
 class AlignmentScorer(torch.nn.Module):
@@ -70,16 +71,69 @@ class PoseScorer(torch.nn.Module):
                 sim[idx] = torch.tensor(-1, dtype=sim[idx].dtype)
         return sim
 
+class PoseKeypointScorer(torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+        self.openpose = OpenposeDetector.from_pretrained('lllyasviel/ControlNet').to(self.device)
+
+    def cosine_distance(self, pose1, pose2):
+        cossim = pose1.dot(np.transpose(pose2)) / (np.linalg.norm(pose1) * np.linalg.norm(pose2))
+        cosdist = (1 - cossim)
+        return cosdist
+
+    def prepare_keypoints(self, keypoints):
+        keypoints_list=[]
+        for keypoint in keypoints[0].body.keypoints:  
+            if keypoint is not None:
+                x, y = keypoint.x, keypoint.y
+                x = int(x * 1024)
+                y = int(y * 1024)
+                keypoints_list.append(x)
+                keypoints_list.append(y)
+            else:
+                keypoints_list.append(0)
+                keypoints_list.append(0)
+        return keypoints_list
+
+    @torch.no_grad()
+    def __call__(self, original_condition_images, original_images, generated_images, prompts, global_step, image_log_dir):
+        gen_conds=[]
+        org_conds=[]
+        scores = []
+        
+        for i in range(len(generated_images)):
+            gen_cond, gen_keypoints = self.openpose(generated_images[i], detect_resolution=1024, image_resolution=1024, return_keypoints=True)
+            org_cond, org_keypoints = self.openpose(original_images[i], detect_resolution=1024, image_resolution=1024, return_keypoints=True)
+            gen_conds.append(gen_cond)
+            org_conds.append(org_cond)
+            # if more than one human is detected, score = 0
+            if len(gen_keypoints) == 1 and len(org_keypoints) == 1: 
+                gen_keypoints = np.array(self.prepare_keypoints(gen_keypoints))
+                org_keypoints = np.array(self.prepare_keypoints(org_keypoints))
+                score = 1-self.cosine_distance(gen_keypoints, org_keypoints)
+            else:
+                score = 0
+            scores.append(score)
+
+        generated_images[0].save(f'{image_log_dir}/{global_step}_gen_0.png')
+        gen_conds[0].save(f'{image_log_dir}/{global_step}_gen_cond_0.png')
+        org_conds[0].save(f'{image_log_dir}/{global_step}_org_cond_0.png')
+        original_images[0].save(f'{image_log_dir}/{global_step}_org_0.png')
+
+        return torch.as_tensor(scores, device=self.device)
+
+
 class RewardComputation():
     def __init__(self, device):
         self.device=device
         self.alignment_scorer = AlignmentScorer(self.device)
-        self.pose_scorer = PoseScorer(self.device)
+        self.pose_scorer = PoseKeypointScorer(self.device)
+        
 
     def reward_fn(self, condition_images, images, prompts, metadata, global_step, image_log_dir):
         alignment_scores = self.alignment_scorer(images, prompts)
         pose_scores = self.pose_scorer(condition_images, images, prompts, global_step, image_log_dir)
-
         scores = alignment_scores + pose_scores #temporary expedient
 
         return scores, {}
@@ -88,6 +142,25 @@ class RewardComputation():
         rewards = []
         for condition_images, images, prompts, prompt_metadata in prompt_image_pairs:
             reward, reward_metadata = self.reward_fn(condition_images, images, prompts, prompt_metadata, global_step, image_log_dir)
+            rewards.append(
+                (
+                    torch.as_tensor(reward, device=self.device),
+                    reward_metadata,
+                )
+            )
+        return zip(*rewards)
+
+    def reward_fn2(self, original_images, condition_images, generated_images, prompts, prompt_metadata, global_step, image_log_dir):
+        alignment_scores = self.alignment_scorer(generated_images, prompts)
+        pose_scores = self.pose_scorer(condition_images, original_images, generated_images, prompts, global_step, image_log_dir)
+        scores = alignment_scores + pose_scores #temporary expedient
+        print(alignment_scores, pose_scores)
+
+        return scores, {}
+    def compute_rewards2(self, prompt_image_pairs, global_step, image_log_dir):
+        rewards = []
+        for original_images, condition_images, generated_images, prompts, prompt_metadata in prompt_image_pairs:
+            reward, reward_metadata = self.reward_fn2(original_images, condition_images, generated_images, prompts, prompt_metadata, global_step, image_log_dir)
             rewards.append(
                 (
                     torch.as_tensor(reward, device=self.device),
