@@ -76,25 +76,62 @@ class PoseKeypointScorer(torch.nn.Module):
         super().__init__()
         self.device = device
         self.openpose = OpenposeDetector.from_pretrained('lllyasviel/ControlNet').to(self.device)
+        self.body_parts_name = ['body', 'left_hand', 'right_hand', 'face']
+
 
     def cosine_distance(self, pose1, pose2):
-        cossim = pose1.dot(np.transpose(pose2)) / (np.linalg.norm(pose1) * np.linalg.norm(pose2))
-        cosdist = (1 - cossim)
-        return cosdist
+        total_sim=[]
+        for body_part in self.body_parts_name:
+            if pose1[body_part] is None and pose2[body_part] is None:
+                continue
+            if pose1[body_part] is None or pose2[body_part] is None:
+                if pose1[body_part] is None:
+                    pose1[body_part] = [-1]*len(pose2[body_part])
+                else:
+                    pose2[body_part] = [-1]*len(pose1[body_part])
 
-    def prepare_keypoints(self, keypoints):
-        keypoints_list=[]
+            p1 = np.array(pose1[body_part])
+            p2 = np.array(pose2[body_part])
+
+            cossim = p1.dot(np.transpose(p2)) / (np.linalg.norm(p1) * np.linalg.norm(p2))
+            cossim = cossim.astype('float16') 
+
+            total_sim.append(cossim)
+        return round(sum(total_sim)/len(total_sim),6)
+
+    def prepare_keypoints(self, keypoints, w=1024, h=1024):
+        body_parts = {'body':[],'left_hand':[], 'right_hand':[], 'face':[]}
+
+        keypoints_list = []
         for keypoint in keypoints[0].body.keypoints:  
             if keypoint is not None:
                 x, y = keypoint.x, keypoint.y
-                x = int(x * 1024)
-                y = int(y * 1024)
+                x = int(x * w)
+                y = int(y * h)
                 keypoints_list.append(x)
                 keypoints_list.append(y)
             else:
-                keypoints_list.append(0)
-                keypoints_list.append(0)
-        return keypoints_list
+                keypoints_list.append(-1)
+                keypoints_list.append(-1)
+        body_parts['body'] = keypoints_list
+
+        for i, keypoints in enumerate(keypoints[0][1:]):  
+            keypoints_list = []
+            if keypoints is not None:
+                for keypoint in keypoints:
+                    x, y = keypoint.x, keypoint.y
+                    if x < 0 and y < 0:
+                        x, y = -1, -1
+                    else:
+                        x = float(x * w)
+                        y = float(y * h)
+                    keypoints_list.append(round(x, 6))
+                    keypoints_list.append(round(y, 6))
+            else:
+                keypoints_list = None
+            body_parts[self.body_parts_name[i+1]] = keypoints_list
+
+        return body_parts
 
     @torch.no_grad()
     def __call__(self, original_condition_images, original_images, generated_images, prompts, global_step, image_log_dir):
@@ -103,25 +140,24 @@ class PoseKeypointScorer(torch.nn.Module):
         scores = []
         
         for i in range(len(generated_images)):
-            gen_cond, gen_keypoints = self.openpose(generated_images[i], detect_resolution=1024, image_resolution=1024, return_keypoints=True)
-            org_cond, org_keypoints = self.openpose(original_images[i], detect_resolution=1024, image_resolution=1024, return_keypoints=True)
+            gen_cond, gen_keypoints = self.openpose(generated_images[i], detect_resolution=1024, image_resolution=1024, return_keypoints=True, hand_and_face=True)
+            org_cond, org_keypoints = self.openpose(original_images[i], detect_resolution=1024, image_resolution=1024, return_keypoints=True, hand_and_face=True)
             gen_conds.append(gen_cond)
             org_conds.append(org_cond)
             # if more than one human is detected, score = 0
             if len(gen_keypoints) == 1 and len(org_keypoints) == 1: 
-                gen_keypoints = np.array(self.prepare_keypoints(gen_keypoints))
-                org_keypoints = np.array(self.prepare_keypoints(org_keypoints))
-                score = 1-self.cosine_distance(gen_keypoints, org_keypoints)
+                gen_keypoints = self.prepare_keypoints(gen_keypoints)
+                org_keypoints = self.prepare_keypoints(org_keypoints)
+                score = self.cosine_distance(gen_keypoints, org_keypoints)
             else:
                 score = 0
             scores.append(score)
-
+            
         generated_images[0].save(f'{image_log_dir}/{global_step}_gen_0.png')
         gen_conds[0].save(f'{image_log_dir}/{global_step}_gen_cond_0.png')
         org_conds[0].save(f'{image_log_dir}/{global_step}_org_cond_0.png')
-        original_images[0].save(f'{image_log_dir}/{global_step}_org_0.png')
-
-        return torch.as_tensor(scores, device=self.device)
+        # original_images[0].save(f'{image_log_dir}/{global_step}_org_0.png')
+        return torch.as_tensor(scores, device=self.device, dtype=torch.float16)
 
 
 class RewardComputation():
@@ -154,9 +190,9 @@ class RewardComputation():
         alignment_scores = self.alignment_scorer(generated_images, prompts)
         pose_scores = self.pose_scorer(condition_images, original_images, generated_images, prompts, global_step, image_log_dir)
         scores = alignment_scores + pose_scores #temporary expedient
-        print(alignment_scores, pose_scores)
-
+        print('->>>a:',alignment_scores, 'p:',pose_scores)
         return scores, {}
+
     def compute_rewards2(self, prompt_image_pairs, global_step, image_log_dir):
         rewards = []
         for original_images, condition_images, generated_images, prompts, prompt_metadata in prompt_image_pairs:
