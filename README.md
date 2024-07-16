@@ -1,1 +1,1 @@
-**Improving Human Pose-Conditioned Generation: Fine-tuning ControlNet Models with Reinforcement Learning**
+# **Improving Human Pose-Conditioned Generation: <br/> Fine-tuning ControlNet Models with Reinforcement Learning**
