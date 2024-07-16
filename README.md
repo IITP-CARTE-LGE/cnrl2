@@ -49,6 +49,10 @@ If the training dataset is ready, a jsonl file that contains all dataset informa
 
 ### 3. Files to be replaced
 
+써야함써야함써야함써야함써야함써야함
+써야함써야함써야함
+써야함써야함
+써야함써야함써야함
 
 ### 4. Strat Training
 You can simply train the model with **VLM + Keypoints Reward fuction** by executing the shell file shown below.
