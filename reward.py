@@ -52,12 +52,12 @@ class PoseScorer(torch.nn.Module):
         no_pose_list = []
         
         for i, image in enumerate(generated_images):
-            image, count = self.openpose(image, detect_resolution=1024, image_resolution=1024, hand_and_face=True)
+            image, count = self.openpose(image, detect_resolution=1024, image_resolution=1024, hand_and_face=False)
             if count == 0:
                 no_pose_list.append(i)
             condition_images.append(image)
 
-        if '0' not in no_pose_list and global_step%500==0:
+        if '0' not in no_pose_list and global_step%100==0:
             generated_images[0].save(f'{image_log_dir}/{global_step}_generated_0.png')
             condition_images[0].save(f'{image_log_dir}/{global_step}_extracted_0.png')
             original_condition_images[0].save(f'{image_log_dir}/{global_step}_original_0.png')
@@ -92,7 +92,6 @@ class PoseKeypointScorer(torch.nn.Module):
 
             p1 = np.array(pose1[body_part])
             p2 = np.array(pose2[body_part])
-
             cossim = p1.dot(np.transpose(p2)) / (np.linalg.norm(p1) * np.linalg.norm(p2))
             cossim = cossim.astype('float16') 
 
@@ -164,13 +163,15 @@ class RewardComputation():
     def __init__(self, device):
         self.device=device
         self.alignment_scorer = AlignmentScorer(self.device)
-        self.pose_scorer = PoseKeypointScorer(self.device)
+        # self.pose_scorer = PoseKeypointScorer(self.device)
+        self.pose_scorer = PoseScorer(self.device)
         
 
     def reward_fn(self, condition_images, images, prompts, metadata, global_step, image_log_dir):
         alignment_scores = self.alignment_scorer(images, prompts)
         pose_scores = self.pose_scorer(condition_images, images, prompts, global_step, image_log_dir)
         scores = alignment_scores + pose_scores #temporary expedient
+        print('!->>>a:',alignment_scores, 'p:',pose_scores)
 
         return scores, {}
 
