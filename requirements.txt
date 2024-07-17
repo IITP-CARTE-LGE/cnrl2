@@ -1,0 +1,12 @@
+diffusers
+bert-score
+Pillow
+datasets
+transformers
+deepspeed
+accelerate
+controlnet_aux
+bitsandbytes
+xformers
+torch
+torchvision
