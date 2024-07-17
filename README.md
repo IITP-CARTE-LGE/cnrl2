@@ -55,11 +55,13 @@ If the training dataset is ready, a jsonl file that contains all dataset informa
 - DINO -> facebook/dinov2-base
 
 ### 3. Codes to be replaced
-써야함 </br>
-써야함 </br>
-써야함 </br>
-써야함 </br>
-써야함 </br>
+For VLM + Keypoints reward, codes in the controlnet_aux library have to be changed.
+
+1. site-packages/controlnet_aux/open_pose/__init__.py
+-> ./openpose/__init__.py
+
+2. site-packages/controlnet_aux/open_pose/face.py
+-> ./openpose/face.py
 
 ### 4. Strat Training
 You can simply train the model with **VLM + Keypoints Reward fuction** by executing the shell file shown below.
