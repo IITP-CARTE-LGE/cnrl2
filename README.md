@@ -30,7 +30,7 @@ Our training code is based on DDPO and ControlNet.
 <p>
 You need at least 10K 1024*1024 source images and corresponding pose conditioning images and prompts for training. Pose conditioning images can be obtained by extracting poses from source images using the OpenPose model. For pose conditioning images, you can choose between OpenPose without hands and face & OpenPose with hands and face.
 
-We collected 31K images and alternative text pairs from several license-free image sites, such as freepik and  adobestock. We ensured that the images contained humans throughout the collection process. The resolution of collected images is 1024x1024. Both types of OpenPose images, with or without facial landmarks and hands keypoints, are extracted from each image. Each dataset sample consists of three images and a text component: the collected image, OpenPose image, OpenPose with hands and face keypoints, and image caption. The dataset is split into train and test at a ratio of 30 to 1. The test dataset consists of 1000 real images of a single person.
+We collected 31K images and alternative text pairs from several license-free image sites, such as Freepik and  Adobe Stock. We ensured that the images contained humans throughout the collection process. The resolution of collected images is 1024x1024. Both types of OpenPose images, with or without facial landmarks and hands keypoints, are extracted from each image. Each dataset sample consists of three images and a text component: the collected image, OpenPose image, OpenPose with hands and face keypoints, and image caption. The dataset is split into train and test at a ratio of 30 to 1. The test dataset consists of 1000 real images of a single person.
 
 If the training dataset is ready, a jsonl file that contains all dataset information is required. Keys for the jsonl file have to be  "image", "condition_image" and "text". The example of the jsonl file is as follows:
 </p>
@@ -50,7 +50,7 @@ If the training dataset is ready, a jsonl file that contains all dataset informa
 - VAE SDXL -> madebyollin/sdxl-vae-fp16-fix
 
 #### Models used for reward computation
-- LLAVAl -> lava-hf/llava-v1.6-mistral-7b-hf
+- LLaVA -> lava-hf/llava-v1.6-mistral-7b-hf
 - OpenPose Detector -> lllyasviel/ControlNet
 - DINO -> facebook/dinov2-base
 
@@ -64,7 +64,7 @@ For VLM + Keypoints reward, codes in the controlnet_aux library have to be chang
 -> ./openpose/face.py
 
 ### 4. Strat Training
-You can simply train the model with **VLM + Keypoints Reward fuction** by executing the shell file shown below.
+You can simply train the model with **VLM + Keypoints Reward fuction**(the best performance) by executing the shell file shown below.
 
 ```bash
 export MODEL_DIR="stabilityai/stable-diffusion-xl-base-1.0"
