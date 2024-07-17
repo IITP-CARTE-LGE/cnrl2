@@ -167,4 +167,4 @@ python ./lpips/lpips_score.py -d0 original/image/path_0 -d1 generated/image/path
   <img src="src/Quantitative_result.png" width="600" title="hover text">
 </p>
 
-Quantitative Evaluation Results of the proposed and baseline models. The best values in each category are underlined.
+The table shown above is quantitative Evaluation Results of the proposed and baseline models. The best values in each category are underlined.
