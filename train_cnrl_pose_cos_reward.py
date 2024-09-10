@@ -1572,7 +1572,7 @@ def main(args):
         tracker_config.pop("validation_prompt")
         tracker_config.pop("validation_image")
 
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs={"wandb":{"name":args.project_name}})
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
