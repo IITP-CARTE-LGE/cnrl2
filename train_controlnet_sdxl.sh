@@ -1,7 +1,7 @@
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export MODEL_DIR="stabilityai/stable-diffusion-xl-base-1.0"
-export OUTPUT_DIR="/share0/heywon/reward1"
+export OUTPUT_DIR="/share0/heywon/test"
 
 
 accelerate launch --config_file /home/heywon/cnrl2/ac_config.yaml --main_process_port 29501 /home/heywon/cnrl2/train_controlnet_sdxl.py \
@@ -18,7 +18,7 @@ accelerate launch --config_file /home/heywon/cnrl2/ac_config.yaml --main_process
  --gradient_accumulation_steps=4 \
  --learning_rate 1e-6 \
  --num_train_inference_steps 50 \
- --image_log_dir /share0/heywon/cache/reward1 \
+ --image_log_dir /share0/heywon/cache/test \
  --enable_xformers_memory_efficient_attention \
  --set_grads_to_none \
  --mixed_precision='fp16' \
@@ -27,5 +27,5 @@ accelerate launch --config_file /home/heywon/cnrl2/ac_config.yaml --main_process
  --image_column='image'\
  --use_8bit_adam \
  --num_train_epochs=3 \
- --tracker_project_name cnrl6 \
- --report_to "wandb" \
+#  --tracker_project_name cnrl6 \
+#  --report_to "wandb" \

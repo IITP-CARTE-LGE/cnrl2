@@ -160,11 +160,13 @@ class PoseKeypointScorer(torch.nn.Module):
 
 
 class RewardComputation():
-    def __init__(self, device):
+    def __init__(self, device, reward_type):
         self.device=device
         self.alignment_scorer = AlignmentScorer(self.device)
-        # self.pose_scorer = PoseKeypointScorer(self.device)
-        self.pose_scorer = PoseScorer(self.device)
+        if reward_type == 'feature':
+            self.pose_scorer = PoseScorer(self.device)
+        elif reward_type == 'keypoints':
+            self.pose_scorer = PoseKeypointScorer(self.device)
         
 
     def reward_fn(self, condition_images, images, prompts, metadata, global_step, image_log_dir):
@@ -176,8 +178,8 @@ class RewardComputation():
 
     def compute_rewards(self, prompt_image_pairs, global_step, image_log_dir):
         rewards = []
-        for condition_images, images, prompts, prompt_metadata in prompt_image_pairs:
-            reward, reward_metadata = self.reward_fn(condition_images, images, prompts, prompt_metadata, global_step, image_log_dir)
+        for original_images, condition_images, generated_images, prompts, prompt_metadata in prompt_image_pairs:
+            reward, reward_metadata = self.reward_fn(condition_images, generated_images, prompts, prompt_metadata, global_step, image_log_dir)
             rewards.append(
                 (
                     torch.as_tensor(reward, device=self.device),

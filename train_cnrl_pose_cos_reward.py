@@ -624,6 +624,7 @@ def parse_args(input_args=None):
 
     parser.add_argument("--train_clip_range", type=float, default=1e-4, help="Clip range")
     parser.add_argument("--train_adv_clip_max", type=float, default=5, help="Clip advantages to the range")
+    parser.add_argument("--reward", type=str, default=None, choices=["keypoints", "feature"])
 
 
     if input_args is not None:
@@ -1325,7 +1326,7 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
 
-    reward_computation = RewardComputation(accelerator.device)
+    reward_computation = RewardComputation(accelerator.device, args.reward)
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
     
@@ -1636,6 +1637,7 @@ def main(args):
             prompt_image_pairs = []
             
             controlnet.eval()
+
             with torch.no_grad():
                 num_channels_latents = unet.config.in_channels
                 shape = (
@@ -1793,7 +1795,10 @@ def main(args):
             #####TODO (DONE): we compute rewards
             # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)            
             samples = {k: torch.cat([s[k] for s in samples]) if k != "prompts" else [s[k] for s in samples] for k in samples[0].keys()}
-            rewards, rewards_metadata = reward_computation.compute_rewards2(prompt_image_pairs, global_step, args.image_log_dir)
+            if args.reward == 'feature':
+                rewards, rewards_metadata = reward_computation.compute_rewards(prompt_image_pairs, global_step, args.image_log_dir)
+            elif args.reward == 'keypoints':
+                rewards, rewards_metadata = reward_computation.compute_rewards2(prompt_image_pairs, global_step, args.image_log_dir)
             #####TODO: we compute rewards
             
             #####TODO: turn rewards into advantages
