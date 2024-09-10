@@ -66,6 +66,9 @@ class PoseScorer(torch.nn.Module):
         condition_features = self.feature_extraction(condition_images)
         cos = nn.CosineSimilarity(dim=1)
         sim = cos(original_condition_features, condition_features)
+        #min max scaling
+        min_, max_ = 0.9, 1
+        sim=(sim-min_)/(max_-min_)
         if len(no_pose_list) != 0:
             for idx in no_pose_list:
                 sim[idx] = torch.tensor(-1, dtype=sim[idx].dtype)
