@@ -621,7 +621,7 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-
+    parser.add_argument("--project_name", type=str)
     parser.add_argument("--train_clip_range", type=float, default=1e-4, help="Clip range")
     parser.add_argument("--train_adv_clip_max", type=float, default=5, help="Clip advantages to the range")
 
@@ -1574,7 +1574,8 @@ def main(args):
         tracker_config.pop("validation_prompt")
         tracker_config.pop("validation_image")
 
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        # accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs={"wandb":{"name":args.project_name}})
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
